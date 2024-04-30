@@ -34,73 +34,53 @@ fn encode_value(val: &Value) -> String {
         Value::Integer(i) => format!(":{}\r\n", i),
         Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
         Value::Array(vals) => {
-            let mut head = format!("*{}\r\n", vals.len());
-            let body = vals.iter().map(encode_value);
-            head.extend(body);
+            let head = format!("*{}\r\n", vals.len());
+            let body = vals.iter().map(encode_value).collect::<String>();
 
-            head
+            head + &body
         }
         Value::Null => "_\r\n".to_string(),
     }
 }
 
 #[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+async fn main() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:6379").await?;
 
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                println!("Accepted connection: {}", addr);
-
-                tokio::spawn(handler(stream));
-            }
-            Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
-            }
-        }
+        let (stream, addr) = listener.accept().await?;
+        println!("Accepted connection from {}", addr);
+        tokio::spawn(handle_connection(stream));
     }
 }
 
-async fn handler(mut stream: TcpStream) {
-    let mut buf = [0; 1024];
+async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+    let mut buffer = [0; 1024];
 
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => {
-                println!("Connection closed");
-                return;
-            }
-            Ok(n) => {
-                println!("Received: {:?}", String::from_utf8_lossy(&buf[..n]));
-
-                match parse_command(&buf[..n]) {
-                    Ok(cmd) => {
-                        println!("Parsed command: {:?}", cmd);
-
-                        let resp = match cmd {
-                            Command::Ping => Value::SimpleString("PONG".to_string()),
-                            Command::Echo(val) => val,
-                        };
-
-                        let encoded = encode_value(&resp);
-
-                        if let Err(e) = stream.write_all(encoded.as_bytes()).await {
-                            panic!("Error writing to stream: {}", e);
-                        }
-
-                        println!("Sent response: {:?}", encoded);
-                    }
-                    Err(e) => {
-                        println!("Error parsing command: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                panic!("Error reading from stream: {}", e);
-            }
+        let n = stream.read(&mut buffer).await?;
+        if n == 0 {
+            println!("Connection closed by peer");
+            break;
         }
+
+        let received_data = &buffer[..n];
+        println!("Received: {:?}", String::from_utf8_lossy(received_data));
+
+        let command = parse_command(received_data)?;
+        println!("Parsed command: {:?}", command);
+
+        let response = match command {
+            Command::Ping => Value::SimpleString("PONG".to_string()),
+            Command::Echo(value) => value,
+        };
+
+        let encoded_response = encode_value(&response);
+        stream.write_all(encoded_response.as_bytes()).await?;
+        println!("Sent response: {}", encoded_response);
     }
+
+    Ok(())
 }
 
 fn parse_command(input: &[u8]) -> Result<Command> {
