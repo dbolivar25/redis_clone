@@ -83,11 +83,7 @@ async fn handler(mut stream: TcpStream) {
                             Command::Echo(val) => val,
                         };
 
-                        println!("Response: {:?}", resp);
-
                         let encoded = encode_value(&resp);
-
-                        println!("Sending response: {:?}", encoded);
 
                         if let Err(e) = stream.write_all(encoded.as_bytes()).await {
                             panic!("Error writing to stream: {}", e);
