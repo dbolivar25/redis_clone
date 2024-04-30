@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take},
@@ -54,89 +54,116 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream) {
     let mut buffer = [0; 1024];
 
     loop {
-        let n = stream.read(&mut buffer).await?;
-        if n == 0 {
-            println!("Connection closed by peer");
-            break;
-        }
+        let n = match stream.read(&mut buffer).await {
+            Ok(0) => {
+                println!("Connection closed");
+                return;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("Failed to read from socket: {}", e);
+                return;
+            }
+        };
 
         let received_data = &buffer[..n];
         println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
-        let command = parse_command(received_data)?;
-        println!("Parsed command: {:?}", command);
+        let command = match parse_command(received_data) {
+            Ok(command) => command,
+            Err(e) => {
+                eprintln!("Failed to parse command: {}", e);
+                continue;
+            }
+        };
 
         let response = match command {
             Command::Ping => Value::SimpleString("PONG".to_string()),
-            Command::Echo(value) => value,
+            Command::Echo(val) => val,
         };
 
         let encoded_response = encode_value(&response);
-        stream.write_all(encoded_response.as_bytes()).await?;
-        println!("Sent response: {}", encoded_response);
-    }
 
-    Ok(())
+        if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+            eprintln!("Failed to write to socket: {}", e);
+            return;
+        }
+
+        println!("Sent: {}", encoded_response);
+    }
 }
 
 fn parse_command(input: &[u8]) -> Result<Command> {
-    let (_, vals) = parse_value(input).map_err(|e| anyhow::anyhow!("Error parsing: {:?}", e))?;
-
-    let mut iter = match vals {
-        Value::Array(vals) => vals.into_iter(),
-        _ => return Err(anyhow::anyhow!("Invalid command type")),
+    let (_, array) = parse_array(input).map_err(|_| anyhow!("Failed to parse command"))?;
+    let mut args = match array {
+        Value::Array(args) => args.into_iter(),
+        _ => unreachable!(),
     };
 
-    let cmd = iter
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Empty command"))?;
+    let command_value = args.next().ok_or_else(|| anyhow!("Empty command"))?;
+    let command = match command_value {
+        Value::BulkString(command) => command,
+        _ => return Err(anyhow!("Invalid command type: expected a BulkString")),
+    };
 
-    match cmd {
-        Value::BulkString(s) => match s.to_lowercase().as_str() {
-            "ping" => {
-                if iter.next().is_some() {
-                    return Err(anyhow::anyhow!("Too many arguments"));
-                }
-
+    match command.to_lowercase().as_str() {
+        "ping" => {
+            if args.next().is_some() {
+                Err(anyhow!("PING command does not take any arguments"))
+            } else {
                 Ok(Command::Ping)
             }
-            "echo" => {
-                let val = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Missing value"))?;
-
-                if iter.next().is_some() {
-                    return Err(anyhow::anyhow!("Too many arguments"));
-                }
-
-                Ok(Command::Echo(val))
+        }
+        "echo" => {
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow!("Missing value for ECHO command"))?;
+            if args.next().is_some() {
+                Err(anyhow!("ECHO command takes exactly one argument"))
+            } else {
+                Ok(Command::Echo(value))
             }
-            _ => Err(anyhow::anyhow!("Unknown command: {}", s)),
-        },
-        _ => Err(anyhow::anyhow!("Invalid command type")),
+        }
+        _ => Err(anyhow!("Unknown command: {}", command)),
     }
 }
 
 fn parse_value(input: &[u8]) -> IResult<&[u8], Value> {
     alt((
-        preceded(tag("+"), parse_simple_string),
-        preceded(tag(":"), parse_integer),
-        preceded(tag("$"), parse_bulk_string),
-        preceded(tag("*"), parse_array),
+        parse_simple_string,
+        parse_integer,
+        parse_bulk_string,
+        parse_array,
     ))(input)
 }
 
 fn parse_simple_string(input: &[u8]) -> IResult<&[u8], Value> {
+    preceded(tag("+"), parse_simple_string_impl)(input)
+}
+
+fn parse_integer(input: &[u8]) -> IResult<&[u8], Value> {
+    preceded(tag(":"), parse_integer_impl)(input)
+}
+
+fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], Value> {
+    preceded(tag("$"), parse_bulk_string_impl)(input)
+}
+
+fn parse_array(input: &[u8]) -> IResult<&[u8], Value> {
+    preceded(tag("*"), parse_array_impl)(input)
+}
+
+fn parse_simple_string_impl(input: &[u8]) -> IResult<&[u8], Value> {
     map(terminated(alphanumeric0, parse_crlf), |s| {
         Value::SimpleString(String::from_utf8_lossy(s).to_string())
     })(input)
 }
 
-fn parse_integer(input: &[u8]) -> IResult<&[u8], Value> {
+fn parse_integer_impl(input: &[u8]) -> IResult<&[u8], Value> {
     map(
         terminated(pair(opt(alt((tag("+"), tag("-")))), digit1), parse_crlf),
         |(sign, val)| {
@@ -149,12 +176,12 @@ fn parse_integer(input: &[u8]) -> IResult<&[u8], Value> {
     )(input)
 }
 
-fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], Value> {
-    let (input, val) = parse_integer(input)?;
+fn parse_bulk_string_impl(input: &[u8]) -> IResult<&[u8], Value> {
+    let (input, val) = parse_integer_impl(input)?;
 
     let len = match val {
         Value::Integer(-1) => return Ok((input, Value::Null)),
-        Value::Integer(len) => len,
+        Value::Integer(len) if len >= 0 => len,
         _ => {
             return Err(nom::Err::Failure(nom::error::Error::new(
                 input,
@@ -170,12 +197,12 @@ fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], Value> {
     Ok((input, Value::BulkString(data)))
 }
 
-fn parse_array(input: &[u8]) -> IResult<&[u8], Value> {
-    let (input, val) = parse_integer(input)?;
+fn parse_array_impl(input: &[u8]) -> IResult<&[u8], Value> {
+    let (input, val) = parse_integer_impl(input)?;
 
     let len = match val {
         Value::Integer(-1) => return Ok((input, Value::Null)),
-        Value::Integer(len) => len,
+        Value::Integer(len) if len >= 0 => len,
         _ => {
             return Err(nom::Err::Failure(nom::error::Error::new(
                 input,
