@@ -4,9 +4,6 @@ use std::{
 };
 
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
-
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
 
     listener.incoming().for_each(|stream| match stream {
@@ -15,10 +12,17 @@ fn main() {
 
             let mut buf = [0; 1024];
 
-            stream.read(&mut buf).unwrap();
-            println!("Received: {:?}", buf);
+            loop {
+                let bytes_read = stream.read(&mut buf).unwrap();
+                if bytes_read == 0 {
+                    println!("Connection closed");
+                    break;
+                }
 
-            stream.write(b"+PONG\r\n").unwrap();
+                println!("Bytes read: {}", bytes_read);
+
+                stream.write(b"+PONG\r\n").unwrap();
+            }
         }
         Err(e) => {
             println!("Error: {:?}", e);
