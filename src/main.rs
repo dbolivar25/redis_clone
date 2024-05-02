@@ -311,7 +311,9 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                 Some(Value::BulkString(s)) => match s.to_lowercase().as_str() {
                     "ex" => {
                         let expiration = match args.next() {
-                            Some(Value::Integer(expiration)) => Some(expiration * 1000),
+                            Some(Value::BulkString(expiration)) => {
+                                Some(expiration.parse::<i64>()? * 1000)
+                            }
                             Some(_) => return Err(anyhow!("Invalid expiration time")),
                             None => None,
                         };
@@ -324,7 +326,7 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                     }
                     "px" => {
                         let expiration = match args.next() {
-                            Some(Value::Integer(expiration)) => Some(expiration),
+                            Some(Value::BulkString(expiration)) => Some(expiration.parse::<i64>()?),
                             Some(_) => return Err(anyhow!("Invalid expiration time")),
                             None => None,
                         };
