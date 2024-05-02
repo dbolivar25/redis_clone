@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use nom::{
@@ -17,33 +16,31 @@ use tokio::{
     sync::mpsc::{Receiver, Sender},
 };
 
+use chrono;
+
 // IDEA FOR EXPIRATION HANDLING: STORE EXPIRATION TIME WITH VALUE AND ALSO KEEP A SEPARATE STRUCTURE
 // WITH THE EXPIRATION TIME AS THE KEY AND THE DATA MAP KEY AS THE VALUE. WHEN WE GET AN EXPIRED
 // KEY GRAB ALL EXPIRATION TIMES THAT ARE LESS THAN OR EQUAL TO THE CURRENT TIME AND DELETE
 // THEM FROM THE EXPIRATION MAP AND THE DATA MAP ALL AT ONCE.
-
-// SWITCH TO AN EVENT LOOP MODEL WHERE WE HAVE A SINGLE TOKIO TASK THAT HANDLES ALL CONNECTIONS
-// AND COMMANDS. THIS WAY WE CAN HAVE A SINGLE STORAGE STRUCTURE THAT IS SHARED ACROSS ALL
-// CONNECTIONS. WE CAN USE A CHANNEL TO SEND COMMANDS TO THE TASK AND RECEIVE RESPONSES.
-// WE CAN ALSO USE A CHANNEL TO SEND COMMANDS TO THE TASK TO SHUTDOWN.
 
 #[derive(Debug)]
 enum Command {
     Ping,
     Echo(Value),
     Get(Value),
-    Set(Value, Value),
+    Set(Value, Value, Option<i64>),
 }
 
 #[derive(Debug)]
 struct Message {
     command: Command,
-    response: Sender<Value>,
+    response_sender: Sender<Value>,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 enum Value {
     SimpleString(String),
+    SimpleError(String),
     Integer(i64),
     BulkString(String),
     Array(Vec<Value>),
@@ -54,7 +51,7 @@ enum Value {
 
 #[derive(Debug)]
 struct DataActor {
-    data: HashMap<Value, Value>,
+    data: HashMap<Value, (Option<i64>, Value)>,
     expiration: BTreeMap<i64, Value>,
     msg_receiver: Receiver<Message>,
 }
@@ -79,10 +76,10 @@ impl DataActor {
                 Command::Ping => self.handle_ping(),
                 Command::Echo(value) => self.handle_echo(value),
                 Command::Get(key) => self.handle_get(key),
-                Command::Set(key, value) => self.handle_set(key, value),
+                Command::Set(key, value, expiration) => self.handle_set(key, expiration, value),
             };
 
-            match message.response.send(response).await {
+            match message.response_sender.send(response).await {
                 Ok(_) => {}
                 Err(e) => eprintln!("Failed to send response: {}", e),
             }
@@ -97,15 +94,42 @@ impl DataActor {
         value
     }
 
-    fn handle_get(&self, key: Value) -> Value {
-        match self.data.get(&key) {
-            Some(value) => value.clone(),
-            None => Value::NullBulkString,
+    fn handle_get(&mut self, key: Value) -> Value {
+        let (expiration, value) = match self.data.get(&key) {
+            Some(pair) => pair,
+            None => return Value::NullBulkString,
+        };
+
+        if let &Some(expiration) = expiration {
+            let now = chrono::Utc::now().timestamp_millis();
+            if expiration <= now {
+                let expired = self
+                    .expiration
+                    .range(..=now)
+                    .map(|(expr, key)| (*expr, key.to_owned()))
+                    .collect::<Vec<_>>();
+
+                expired.iter().for_each(|(expr, key)| {
+                    self.expiration.remove(expr);
+                    self.data.remove(&key);
+                });
+
+                return Value::NullBulkString;
+            }
         }
+
+        value.clone()
     }
 
-    fn handle_set(&mut self, key: Value, value: Value) -> Value {
-        self.data.insert(key, value);
+    fn handle_set(&mut self, key: Value, expiration: Option<i64>, value: Value) -> Value {
+        let expiration_time = expiration.map(|val| chrono::Utc::now().timestamp_millis() + val);
+
+        self.data.insert(key.clone(), (expiration_time, value));
+
+        if let Some(expiration_time) = expiration_time {
+            self.expiration.insert(expiration_time, key);
+        }
+
         Value::SimpleString("OK".to_string())
     }
 }
@@ -115,12 +139,12 @@ struct MsgSender {
 }
 
 impl MsgSender {
-    async fn send_command(&self, command: Command) -> Result<Value> {
+    async fn handle_command(&self, command: Command) -> Result<Value> {
         let (response_sender, mut response_receiver) = tokio::sync::mpsc::channel(1);
 
         let message = Message {
             command,
-            response: response_sender,
+            response_sender,
         };
 
         self.msg_sender.send(message).await?;
@@ -154,7 +178,7 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        println!("Accepted connection from {}", addr);
+        println!("\nAccepted connection from {}", addr);
 
         let context = Context::new(stream, msg_sender.clone());
         tokio::spawn(handle_connection(context));
@@ -188,15 +212,37 @@ async fn handle_connection(context: Context) {
             Ok(command) => command,
             Err(e) => {
                 eprintln!("Failed to parse command: {}", e);
+
+                let response = Value::SimpleError(e.to_string());
+                let encoded_response = encode_value(&response);
+
+                if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                    eprintln!("Failed to write to socket: {}", e);
+                    return;
+                }
+
+                println!("Sent: {:?}", encoded_response);
+
                 continue;
             }
         };
 
-        let response = match msg_sender.send_command(command).await {
+        let response = match msg_sender.handle_command(command).await {
             Ok(response) => response,
             Err(e) => {
                 eprintln!("Failed to send command: {}", e);
-                return;
+
+                let response = Value::SimpleError(e.to_string());
+                let encoded_response = encode_value(&response);
+
+                if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                    eprintln!("Failed to write to socket: {}", e);
+                    return;
+                }
+
+                println!("Sent: {:?}", encoded_response);
+
+                continue;
             }
         };
 
@@ -212,7 +258,7 @@ async fn handle_connection(context: Context) {
 }
 
 fn parse_command(input: &[u8]) -> Result<Command> {
-    let (_, array) = parse_array(input).map_err(|_| anyhow!("Failed to parse command"))?;
+    let (_, array) = parse_array(input).map_err(|_| anyhow!("Failed to parse array"))?;
     let mut args = match array {
         Value::Array(args) => args.into_iter(),
         _ => unreachable!(),
@@ -256,13 +302,49 @@ fn parse_command(input: &[u8]) -> Result<Command> {
             let key = args
                 .next()
                 .ok_or_else(|| anyhow!("Missing key for SET command"))?;
+
             let value = args
                 .next()
                 .ok_or_else(|| anyhow!("Missing value for SET command"))?;
-            if args.next().is_some() {
-                Err(anyhow!("SET command takes exactly two arguments"))
-            } else {
-                Ok(Command::Set(key, value))
+
+            match args.next() {
+                Some(Value::BulkString(s)) => match s.to_lowercase().as_str() {
+                    "ex" => {
+                        let expiration = match args.next() {
+                            Some(Value::Integer(expiration)) => Some(expiration * 1000),
+                            Some(_) => return Err(anyhow!("Invalid expiration time")),
+                            None => None,
+                        };
+
+                        if args.next().is_some() {
+                            Err(anyhow!("SET command takes two or three arguments"))
+                        } else {
+                            Ok(Command::Set(key, value, expiration))
+                        }
+                    }
+                    "px" => {
+                        let expiration = match args.next() {
+                            Some(Value::Integer(expiration)) => Some(expiration),
+                            Some(_) => return Err(anyhow!("Invalid expiration time")),
+                            None => None,
+                        };
+
+                        if args.next().is_some() {
+                            Err(anyhow!("SET command takes two or three arguments"))
+                        } else {
+                            Ok(Command::Set(key, value, expiration))
+                        }
+                    }
+                    _ => return Err(anyhow!("Invalid SET option")),
+                },
+                Some(_) => return Err(anyhow!("Invalid SET option")),
+                None => {
+                    if args.next().is_some() {
+                        Err(anyhow!("SET command takes two or three arguments"))
+                    } else {
+                        Ok(Command::Set(key, value, None))
+                    }
+                }
             }
         }
         _ => Err(anyhow!("Unknown command: {}", command)),
@@ -360,6 +442,7 @@ fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
 fn encode_value(val: &Value) -> String {
     match val {
         Value::SimpleString(s) => format!("+{}\r\n", s),
+        Value::SimpleError(s) => format!("-{}\r\n", s),
         Value::Integer(i) => format!(":{}\r\n", i),
         Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
         Value::Array(vals) => {
