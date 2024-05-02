@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use anyhow::{anyhow, Result};
 use nom::{
@@ -13,28 +16,23 @@ use nom::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    select,
     sync::mpsc::{Receiver, Sender},
+    time::interval,
 };
-
-use chrono::prelude::*;
-
-// IDEA FOR EXPIRATION HANDLING: STORE EXPIRATION TIME WITH VALUE AND ALSO KEEP A SEPARATE STRUCTURE
-// WITH THE EXPIRATION TIME AS THE KEY AND THE DATA MAP KEY AS THE VALUE. WHEN WE GET AN EXPIRED
-// KEY GRAB ALL EXPIRATION TIMES THAT ARE LESS THAN OR EQUAL TO THE CURRENT TIME AND DELETE
-// THEM FROM THE EXPIRATION MAP AND THE DATA MAP ALL AT ONCE.
 
 #[derive(Debug)]
 enum Command {
     Ping,
     Echo(Value),
     Get(Value),
-    Set(Value, Value, Option<i64>),
+    Set(Value, Value, Option<u128>),
 }
 
 #[derive(Debug)]
 struct Message {
     command: Command,
-    response_sender: Sender<Value>,
+    response_sender: Option<Sender<Value>>,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
@@ -51,8 +49,8 @@ enum Value {
 
 #[derive(Debug)]
 struct DataActor {
-    data: HashMap<Value, (Option<i64>, Value)>,
-    expiration: BTreeMap<i64, Value>,
+    data: HashMap<Value, (Option<u128>, Value)>,
+    expiration: BTreeMap<u128, Value>,
     msg_receiver: Receiver<Message>,
 }
 
@@ -71,17 +69,27 @@ impl DataActor {
     }
 
     async fn run(mut self) {
-        while let Some(message) = self.msg_receiver.recv().await {
-            let response = match message.command {
-                Command::Ping => self.handle_ping(),
-                Command::Echo(value) => self.handle_echo(value),
-                Command::Get(key) => self.handle_get(key),
-                Command::Set(key, value, expiration) => self.handle_set(key, expiration, value),
-            };
+        let mut gc_interval = interval(Duration::from_secs(2));
 
-            match message.response_sender.send(response).await {
-                Ok(_) => {}
-                Err(e) => eprintln!("Failed to send response: {}", e),
+        loop {
+            select! {
+                _ = gc_interval.tick() => {
+                    self.handle_expired_keys();
+                }
+                Some(message) = self.msg_receiver.recv() => {
+                    let response = match message.command {
+                        Command::Ping => self.handle_ping(),
+                        Command::Echo(value) => self.handle_echo(value),
+                        Command::Get(key) => self.handle_get(key),
+                        Command::Set(key, value, expiration) => self.handle_set(key, expiration, value),
+                    };
+
+                    if let Some(response_sender) = message.response_sender {
+                        if let Err(e) = response_sender.send(response).await {
+                            eprintln!("Failed to send response: {}", e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -101,18 +109,10 @@ impl DataActor {
         };
 
         if let &Some(expiration) = expiration {
-            let now = chrono::Utc::now().timestamp_millis();
+            let now = chrono::Utc::now().timestamp_millis() as u128;
             if expiration <= now {
-                let expired = self
-                    .expiration
-                    .range(..=now)
-                    .map(|(expr, key)| (*expr, key.to_owned()))
-                    .collect::<Vec<_>>();
-
-                expired.iter().for_each(|(expr, key)| {
-                    self.expiration.remove(expr);
-                    self.data.remove(&key);
-                });
+                self.data.remove(&key);
+                self.expiration.remove(&expiration);
 
                 return Value::NullBulkString;
             }
@@ -121,8 +121,11 @@ impl DataActor {
         value.clone()
     }
 
-    fn handle_set(&mut self, key: Value, expiration: Option<i64>, value: Value) -> Value {
-        let expiration_time = expiration.map(|val| chrono::Utc::now().timestamp_millis() + val);
+    fn handle_set(&mut self, key: Value, expiration: Option<u128>, value: Value) -> Value {
+        let expiration_time = expiration.map(|val| {
+            let now = chrono::Utc::now().timestamp_millis() as u128;
+            now + val
+        });
 
         self.data.insert(key.clone(), (expiration_time, value));
 
@@ -131,6 +134,20 @@ impl DataActor {
         }
 
         Value::SimpleString("OK".to_string())
+    }
+
+    fn handle_expired_keys(&mut self) {
+        let now = chrono::Utc::now().timestamp_millis() as u128;
+        let expired = self
+            .expiration
+            .range(..=now)
+            .map(|(expr, key)| (*expr, key.to_owned()))
+            .collect::<Vec<_>>();
+
+        expired.iter().for_each(|(expr, key)| {
+            self.expiration.remove(expr);
+            self.data.remove(&key);
+        });
     }
 }
 
@@ -144,7 +161,7 @@ impl MsgSender {
 
         let message = Message {
             command,
-            response_sender,
+            response_sender: Some(response_sender),
         };
 
         self.msg_sender.send(message).await?;
@@ -312,7 +329,7 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                     "ex" => {
                         let expiration = match args.next() {
                             Some(Value::BulkString(expiration)) => {
-                                Some(expiration.parse::<i64>()? * 1000)
+                                Some(expiration.parse::<u128>()? * 1000)
                             }
                             Some(_) => return Err(anyhow!("Invalid expiration time")),
                             None => None,
@@ -326,7 +343,9 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                     }
                     "px" => {
                         let expiration = match args.next() {
-                            Some(Value::BulkString(expiration)) => Some(expiration.parse::<i64>()?),
+                            Some(Value::BulkString(expiration)) => {
+                                Some(expiration.parse::<u128>()?)
+                            }
                             Some(_) => return Err(anyhow!("Invalid expiration time")),
                             None => None,
                         };
