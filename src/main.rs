@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+
 use nom::{
     branch::alt,
     bytes::complete::{tag, take},
@@ -13,6 +14,7 @@ use nom::{
     sequence::{pair, preceded, terminated},
     IResult,
 };
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -56,6 +58,33 @@ struct DataActor {
     msg_receiver: Receiver<Message>,
 }
 
+struct MsgSender {
+    msg_sender: Sender<Message>,
+}
+
+struct Context {
+    stream: TcpStream,
+    msg_sender: MsgSender,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:6379").await?;
+    println!("Listening on {}", listener.local_addr()?);
+
+    let (data_actor, msg_sender) = DataActor::new();
+
+    tokio::spawn(data_actor.run());
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        println!("\nAccepted connection from {}", addr);
+
+        let context = Context::new(stream, msg_sender.clone());
+        tokio::spawn(handle_connection(context));
+    }
+}
+
 impl DataActor {
     fn new() -> (Self, Sender<Message>) {
         let (msg_sender, msg_receiver) = mpsc::channel(256);
@@ -71,7 +100,7 @@ impl DataActor {
     }
 
     async fn run(mut self) {
-        let mut gc_interval = interval(Duration::from_secs(2));
+        let mut gc_interval = interval(Duration::from_secs(1));
 
         loop {
             select! {
@@ -83,7 +112,7 @@ impl DataActor {
                         Command::Ping => self.handle_ping(),
                         Command::Echo(value) => self.handle_echo(value),
                         Command::Get(key) => self.handle_get(key),
-                        Command::Set(key, value, expiration) => self.handle_set(key, expiration, value),
+                        Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
                     };
 
                     if let Some(response_sender) = message.response_sender {
@@ -123,7 +152,7 @@ impl DataActor {
         value.clone()
     }
 
-    fn handle_set(&mut self, key: Value, expiration: Option<u128>, value: Value) -> Value {
+    fn handle_set(&mut self, key: Value, value: Value, expiration: Option<u128>) -> Value {
         let expiration_time = expiration.map(|val| {
             let now = Utc::now().timestamp_millis() as u128;
             now + val
@@ -153,10 +182,6 @@ impl DataActor {
     }
 }
 
-struct MsgSender {
-    msg_sender: Sender<Message>,
-}
-
 impl MsgSender {
     async fn handle_command(&self, command: Command) -> Result<Value> {
         let (response_sender, mut response_receiver) = tokio::sync::mpsc::channel(1);
@@ -174,33 +199,10 @@ impl MsgSender {
     }
 }
 
-struct Context {
-    stream: TcpStream,
-    msg_sender: MsgSender,
-}
-
 impl Context {
     fn new(stream: TcpStream, msg_sender: Sender<Message>) -> Self {
         let msg_sender = MsgSender { msg_sender };
         Context { stream, msg_sender }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
-    println!("Listening on {}", listener.local_addr()?);
-
-    let (data_actor, msg_sender) = DataActor::new();
-
-    tokio::spawn(data_actor.run());
-
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        println!("\nAccepted connection from {}", addr);
-
-        let context = Context::new(stream, msg_sender.clone());
-        tokio::spawn(handle_connection(context));
     }
 }
 
@@ -273,6 +275,24 @@ async fn handle_connection(context: Context) {
         }
 
         println!("Sent: {:?}", encoded_response);
+    }
+}
+
+fn encode_value(val: &Value) -> String {
+    match val {
+        Value::SimpleString(s) => format!("+{}\r\n", s),
+        Value::SimpleError(s) => format!("-{}\r\n", s),
+        Value::Integer(i) => format!(":{}\r\n", i),
+        Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
+        Value::Array(vals) => {
+            let n = vals.len();
+            let body = vals.iter().map(encode_value).collect::<String>();
+
+            format!("*{}\r\n{}", n, body)
+        }
+        Value::NullBulkString => "$-1\r\n".to_string(),
+        Value::NullArray => "*-1\r\n".to_string(),
+        Value::Null => "_\r\n".to_string(),
     }
 }
 
@@ -361,13 +381,7 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                     _ => return Err(anyhow!("Invalid SET option")),
                 },
                 Some(_) => return Err(anyhow!("Invalid SET option")),
-                None => {
-                    if args.next().is_some() {
-                        Err(anyhow!("SET command takes two or three arguments"))
-                    } else {
-                        Ok(Command::Set(key, value, None))
-                    }
-                }
+                None => Ok(Command::Set(key, value, None)),
             }
         }
         _ => Err(anyhow!("Unknown command: {}", command)),
@@ -460,22 +474,4 @@ fn parse_array_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
     tag("\r\n")(input)
-}
-
-fn encode_value(val: &Value) -> String {
-    match val {
-        Value::SimpleString(s) => format!("+{}\r\n", s),
-        Value::SimpleError(s) => format!("-{}\r\n", s),
-        Value::Integer(i) => format!(":{}\r\n", i),
-        Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
-        Value::Array(vals) => {
-            let head = format!("*{}\r\n", vals.len());
-            let body = vals.iter().map(encode_value).collect::<String>();
-
-            head + &body
-        }
-        Value::NullBulkString => "$-1\r\n".to_string(),
-        Value::NullArray => "*-1\r\n".to_string(),
-        Value::Null => "_\r\n".to_string(),
-    }
 }
