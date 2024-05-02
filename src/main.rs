@@ -23,7 +23,7 @@ use tokio::{
     time::interval,
 };
 
-use chrono::{self, Utc};
+use chrono::Utc;
 
 #[derive(Debug)]
 enum Command {
@@ -47,7 +47,8 @@ enum Value {
     BulkString(String),
     Array(Vec<Value>),
     NullBulkString,
-    // NullArray,
+    #[allow(dead_code)]
+    NullArray,
     Null,
 }
 
@@ -291,7 +292,7 @@ fn encode_value(val: &Value) -> String {
             format!("*{}\r\n{}", n, body)
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
-        // Value::NullArray => "*-1\r\n".to_string(),
+        Value::NullArray => "*-1\r\n".to_string(),
         Value::Null => "_\r\n".to_string(),
     }
 }
