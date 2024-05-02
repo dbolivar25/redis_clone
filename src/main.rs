@@ -43,6 +43,7 @@ enum Command {
     Echo(Value),
     Get(Value),
     Set(Value, Value, Option<u128>),
+    Info(Value),
 }
 
 #[derive(Debug)]
@@ -65,7 +66,7 @@ enum Value {
 }
 
 #[derive(Debug)]
-struct DataActor {
+struct CommandHandler {
     data: HashMap<Value, (Option<u128>, Value)>,
     expiration: BTreeMap<u128, Value>,
     msg_receiver: Receiver<Message>,
@@ -88,9 +89,9 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     println!("Listening on {}", listener.local_addr()?);
 
-    let (data_actor, msg_sender) = DataActor::new();
+    let (command_handler, msg_sender) = CommandHandler::new();
 
-    tokio::spawn(data_actor.run());
+    tokio::spawn(command_handler.run());
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -101,12 +102,12 @@ async fn main() -> Result<()> {
     }
 }
 
-impl DataActor {
+impl CommandHandler {
     fn new() -> (Self, Sender<Message>) {
         let (msg_sender, msg_receiver) = mpsc::channel(256);
 
         (
-            DataActor {
+            CommandHandler {
                 data: HashMap::new(),
                 expiration: BTreeMap::new(),
                 msg_receiver,
@@ -129,6 +130,7 @@ impl DataActor {
                         Command::Echo(value) => self.handle_echo(value),
                         Command::Get(key) => self.handle_get(key),
                         Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
+                        Command::Info(of_type) => self.handle_info(of_type),
                     };
 
                     if let Some(response_sender) = message.response_sender {
@@ -183,6 +185,23 @@ impl DataActor {
         Value::SimpleString("OK".to_string())
     }
 
+    fn handle_info(&self, of_type: Value) -> Value {
+        match of_type {
+            Value::BulkString(s) => match s.as_str() {
+                "replication" => {
+                    let mut info = Vec::new();
+                    info.push("role:master".to_string());
+
+                    let size = info.iter().map(|s| s.len()).sum::<usize>();
+                    let info = info.join("\n");
+
+                    Value::BulkString(format!("{}\r\n{}", size, info))
+                }
+            },
+            _ => Value::SimpleError("Invalid INFO subcommand string format".to_string()),
+        }
+    }
+
     fn handle_expired_keys(&mut self) {
         let now = Utc::now().timestamp_millis() as u128;
         let expired = self
@@ -199,8 +218,8 @@ impl DataActor {
 }
 
 impl MsgSender {
-    async fn handle_command(&self, command: Command) -> Result<Value> {
-        let (response_sender, mut response_receiver) = tokio::sync::mpsc::channel(1);
+    async fn send_command(&self, command: Command) -> Result<Value> {
+        let (response_sender, mut response_receiver) = mpsc::channel(1);
 
         let message = Message {
             command,
@@ -264,7 +283,7 @@ async fn handle_connection(context: Context) {
             }
         };
 
-        let response = match msg_sender.handle_command(command).await {
+        let response = match msg_sender.send_command(command).await {
             Ok(response) => response,
             Err(e) => {
                 eprintln!("Failed to send command: {}", e);
@@ -398,6 +417,13 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                 },
                 Some(_) => return Err(anyhow!("Invalid SET option")),
                 None => Ok(Command::Set(key, value, None)),
+            }
+        }
+        "info" => {
+            if args.next().is_some() {
+                Err(anyhow!("INFO command does not take any arguments"))
+            } else {
+                Ok(Command::Info)
             }
         }
         _ => Err(anyhow!("Unknown command: {}", command)),
