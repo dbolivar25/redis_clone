@@ -32,6 +32,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[clap(version, author = "Daniel Bolivar")]
 struct Args {
+    /// Port to listen on
     #[clap(short, long, default_value = "6379")]
     port: u16,
 }
