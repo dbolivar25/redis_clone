@@ -187,17 +187,14 @@ impl CommandHandler {
 
     fn handle_info(&self, of_type: Value) -> Value {
         match of_type {
-            Value::BulkString(s) => match s.as_str() {
-                "replication" => {
-                    let mut info = Vec::new();
-                    info.push("role:master".to_string());
+            Value::BulkString(s) => {
+                let info = match s.as_str() {
+                    "replication" => vec!["role:master", "connected_slaves:0"],
+                    _ => vec!["DEFAULT INFO"],
+                };
 
-                    let size = info.iter().map(|s| s.len()).sum::<usize>();
-                    let info = info.join("\n");
-
-                    Value::BulkString(format!("{}\r\n{}", size, info))
-                }
-            },
+                Value::BulkString(info.join("\n"))
+            }
             _ => Value::SimpleError("Invalid INFO subcommand string format".to_string()),
         }
     }
@@ -420,10 +417,14 @@ fn parse_command(input: &[u8]) -> Result<Command> {
             }
         }
         "info" => {
-            if args.next().is_some() {
-                Err(anyhow!("INFO command does not take any arguments"))
+            if let Some(of_type) = args.next() {
+                if args.next().is_some() {
+                    Err(anyhow!("INFO command takes zero or one argument"))
+                } else {
+                    Ok(Command::Info(of_type))
+                }
             } else {
-                Ok(Command::Info)
+                Ok(Command::Info(Value::BulkString("default".to_string())))
             }
         }
         _ => Err(anyhow!("Unknown command: {}", command)),
