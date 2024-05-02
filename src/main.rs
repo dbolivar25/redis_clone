@@ -25,6 +25,17 @@ use tokio::{
 
 use chrono::Utc;
 
+// clap interface
+use clap::Parser;
+
+/// Redis server
+#[derive(Parser, Debug)]
+#[clap(version, author = "Daniel Bolivar")]
+struct Args {
+    #[clap(short, long, default_value = "6379")]
+    port: u16,
+}
+
 #[derive(Debug)]
 enum Command {
     Ping,
@@ -70,7 +81,10 @@ struct Context {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
+    let args = Args::parse();
+    let bind_addr = format!("127.0.0.1:{}", args.port);
+
+    let listener = TcpListener::bind(bind_addr).await?;
     println!("Listening on {}", listener.local_addr()?);
 
     let (data_actor, msg_sender) = DataActor::new();
