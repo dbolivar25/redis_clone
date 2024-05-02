@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::mpsc,
     time::Duration,
 };
 
@@ -18,11 +17,11 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     select,
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     time::interval,
 };
 
-use chrono;
+use chrono::{self, Utc};
 
 #[derive(Debug)]
 enum Command {
@@ -112,7 +111,7 @@ impl DataActor {
         };
 
         if let &Some(expiration) = expiration {
-            let now = chrono::Utc::now().timestamp_millis() as u128;
+            let now = Utc::now().timestamp_millis() as u128;
             if expiration <= now {
                 self.data.remove(&key);
                 self.expiration.remove(&expiration);
@@ -126,7 +125,7 @@ impl DataActor {
 
     fn handle_set(&mut self, key: Value, expiration: Option<u128>, value: Value) -> Value {
         let expiration_time = expiration.map(|val| {
-            let now = chrono::Utc::now().timestamp_millis() as u128;
+            let now = Utc::now().timestamp_millis() as u128;
             now + val
         });
 
@@ -140,7 +139,7 @@ impl DataActor {
     }
 
     fn handle_expired_keys(&mut self) {
-        let now = chrono::Utc::now().timestamp_millis() as u128;
+        let now = Utc::now().timestamp_millis() as u128;
         let expired = self
             .expiration
             .range(..=now)
