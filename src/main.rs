@@ -637,6 +637,21 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                 Ok(Command::ReplConf(key, value))
             }
         }
+        "psync" => {
+            let replid = args
+                .next()
+                .ok_or_else(|| anyhow!("Missing REPLID for PSYNC command"))?;
+
+            let offset = args
+                .next()
+                .ok_or_else(|| anyhow!("Missing OFFSET for PSYNC command"))?;
+
+            if args.next().is_some() {
+                Err(anyhow!("PSYNC command takes exactly two arguments"))
+            } else {
+                Ok(Command::Psync(replid, offset))
+            }
+        }
         _ => Err(anyhow!("Unknown command: {}", command)),
     }
 }
