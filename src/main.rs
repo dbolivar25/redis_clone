@@ -46,7 +46,7 @@ struct Args {
 #[derive(Debug)]
 enum ServerType {
     Master(u32, String, u128),
-    Slave(String, String),
+    Slave(TcpStream),
 }
 
 #[derive(Debug)]
@@ -104,7 +104,11 @@ async fn main() -> Result<()> {
 
     let server_type = match args.replicaof.as_slice() {
         [] => ServerType::Master(0, "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), 0),
-        [host, port] => ServerType::Slave(host.clone(), port.clone()),
+        [host, port] => {
+            let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+
+            ServerType::Slave(stream)
+        }
         _ => unreachable!(),
     };
 
@@ -125,7 +129,7 @@ impl Display for ServerType {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             ServerType::Master(_count, _replid, _repl_offset) => write!(f, "master"),
-            ServerType::Slave(_host, _port) => write!(f, "slave"),
+            ServerType::Slave(_master_strm) => write!(f, "slave"),
         }
     }
 }
@@ -147,6 +151,16 @@ impl CommandHandler {
 
     async fn run(mut self) {
         let mut gc_interval = interval(Duration::from_secs(1));
+
+        if let ServerType::Slave(ref mut stream) = self.server_type {
+            let encoded_response =
+                encode_value(&Value::Array(vec![Value::BulkString("PING".to_string())]));
+
+            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                eprintln!("Failed to write to socket: {}", e);
+                return;
+            }
+        }
 
         loop {
             select! {
@@ -221,14 +235,14 @@ impl CommandHandler {
                     "replication" => {
                         let role = match &self.server_type {
                             ServerType::Master(_, _, _) => "master",
-                            ServerType::Slave(_, _) => "slave",
+                            ServerType::Slave(_) => "slave",
                         };
 
                         let (replid, repl_offset) = match &self.server_type {
                             ServerType::Master(_, replid, repl_offset) => {
                                 (replid.as_str(), repl_offset)
                             }
-                            ServerType::Slave(_, _) => ("0", &0),
+                            ServerType::Slave(_) => ("0", &0),
                         };
 
                         vec![
