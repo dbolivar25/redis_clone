@@ -265,7 +265,7 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
-            let (remaining, response) = match parse_value(received_data) {
+            let (_remaining, response) = match parse_value(received_data) {
                 Ok(res) => res,
                 Err(e) => {
                     eprintln!("Failed to parse response: {}", e);
@@ -274,11 +274,8 @@ impl CommandHandler {
             };
 
             match response {
-                Value::FullResync(replid, offset, rdb) => {
-                    println!(
-                        "Received full resync: replid={}, offset={}, rdb={}",
-                        replid, offset, rdb
-                    );
+                Value::FullResync(_replid, _offset, _rdb) => {
+                    println!("Handshake complete");
                 }
                 _ => {
                     eprintln!("Failed to sync with master: invalid response");
