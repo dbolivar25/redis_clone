@@ -56,6 +56,7 @@ enum Command {
     Get(Value),
     Set(Value, Value, Option<u128>),
     Info(Value),
+    ReplConf(Value, Value),
 }
 
 #[derive(Debug)]
@@ -79,6 +80,7 @@ enum Value {
 
 #[derive(Debug)]
 struct CommandHandler {
+    listen_addr: String,
     server_type: ServerType,
     data: HashMap<Value, (Option<u128>, Value)>,
     expiration: BTreeMap<u128, Value>,
@@ -99,7 +101,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let bind_addr = format!("127.0.0.1:{}", args.port);
 
-    let listener = TcpListener::bind(bind_addr).await?;
+    let listener = TcpListener::bind(bind_addr.clone()).await?;
     println!("Listening on {}", listener.local_addr()?);
 
     let server_type = match args.replicaof.as_slice() {
@@ -112,7 +114,7 @@ async fn main() -> Result<()> {
         _ => unreachable!(),
     };
 
-    let (command_handler, msg_sender) = CommandHandler::new(server_type);
+    let (command_handler, msg_sender) = CommandHandler::new(bind_addr, server_type);
 
     tokio::spawn(command_handler.run());
 
@@ -135,11 +137,12 @@ impl Display for ServerType {
 }
 
 impl CommandHandler {
-    fn new(server_type: ServerType) -> (Self, Sender<Message>) {
+    fn new(listen_addr: String, server_type: ServerType) -> (Self, Sender<Message>) {
         let (msg_sender, msg_receiver) = mpsc::channel(256);
 
         (
             CommandHandler {
+                listen_addr,
                 server_type,
                 data: HashMap::new(),
                 expiration: BTreeMap::new(),
@@ -160,6 +163,28 @@ impl CommandHandler {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
+
+            let encoded_response = encode_value(&Value::Array(vec![
+                Value::BulkString("REPLCONF".to_string()),
+                Value::BulkString("listening-port".to_string()),
+                Value::BulkString(format!("{}", self.listen_addr)),
+            ]));
+
+            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                eprintln!("Failed to write to socket: {}", e);
+                return;
+            }
+
+            let encoded_response = encode_value(&Value::Array(vec![
+                Value::BulkString("REPLCONF".to_string()),
+                Value::BulkString("capa".to_string()),
+                Value::BulkString("psync2".to_string()),
+            ]));
+
+            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                eprintln!("Failed to write to socket: {}", e);
+                return;
+            }
         }
 
         loop {
@@ -174,6 +199,7 @@ impl CommandHandler {
                         Command::Get(key) => self.handle_get(key),
                         Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
                         Command::Info(of_type) => self.handle_info(of_type),
+                        Command::ReplConf(_key, _value) => Value::SimpleString("OK".to_string()),
                     };
 
                     if let Some(response_sender) = message.response_sender {
@@ -487,6 +513,21 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                 }
             } else {
                 Ok(Command::Info(Value::BulkString("default".to_string())))
+            }
+        }
+        "replconf" => {
+            let key = args
+                .next()
+                .ok_or_else(|| anyhow!("Missing key for REPLCONF command"))?;
+
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow!("Missing value for REPLCONF command"))?;
+
+            if args.next().is_some() {
+                Err(anyhow!("REPLCONF command takes exactly two arguments"))
+            } else {
+                Ok(Command::ReplConf(key, value))
             }
         }
         _ => Err(anyhow!("Unknown command: {}", command)),
