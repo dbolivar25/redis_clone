@@ -10,11 +10,11 @@ use anyhow::{anyhow, Result};
 use itertools::{Either, Itertools};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take, take_till, take_until},
-    character::complete::{alphanumeric0, alphanumeric1, digit1},
+    bytes::complete::{tag, take, take_until},
+    character::complete::digit1,
     combinator::{map, opt},
-    multi::{count, many_till},
-    sequence::{pair, preceded, separated_pair, terminated},
+    multi::count,
+    sequence::{pair, preceded, terminated},
     IResult,
 };
 
@@ -265,7 +265,7 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
-            let (remaining, response) = match parse_simple_string(received_data) {
+            let (_remaining, response) = match parse_simple_string(received_data) {
                 Ok(res) => res,
                 Err(e) => {
                     eprintln!("Failed to parse response: {}", e);
@@ -273,12 +273,9 @@ impl CommandHandler {
                 }
             };
 
-            dbg!(&response);
-
             match response {
                 Value::SimpleString(s) => {
                     let parts = s.split_whitespace().collect::<Vec<_>>();
-                    dbg!("HERE");
                     match parts.as_slice() {
                         [msg] if msg.to_lowercase().as_str() == "continue" => {}
                         [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
@@ -338,7 +335,6 @@ impl CommandHandler {
 
                     if let Some(response_sender) = message.response_sender {
                         for response in responses {
-                            dbg!(&response);
                             if let Err(e) = response_sender.send(response).await {
                                 eprintln!("Failed to send response: {}", e);
                             }
@@ -467,7 +463,7 @@ impl CommandHandler {
 }
 
 impl MsgSender {
-    async fn send_command(&self, command: Command) -> Result<Value> {
+    async fn send_command(&self, command: Command) -> Result<Vec<Value>> {
         let (response_sender, mut response_receiver) = mpsc::channel(2);
 
         let message = Message {
@@ -476,10 +472,13 @@ impl MsgSender {
         };
 
         self.msg_sender.send(message).await?;
-        response_receiver
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("Failed to receive response"))
+
+        let mut responses = Vec::new();
+        while let Some(response) = response_receiver.recv().await {
+            responses.push(response);
+        }
+
+        Ok(responses)
     }
 }
 
@@ -532,7 +531,7 @@ async fn handle_connection(context: Context) {
             }
         };
 
-        let response = match msg_sender.send_command(command).await {
+        let responses = match msg_sender.send_command(command).await {
             Ok(response) => response,
             Err(e) => {
                 eprintln!("Failed to send command: {}", e);
@@ -551,14 +550,16 @@ async fn handle_connection(context: Context) {
             }
         };
 
-        let encoded_response = encode_value(&response);
+        for response in responses {
+            let encoded_response = encode_value(&response);
 
-        if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
-            eprintln!("Failed to write to socket: {}", e);
-            return;
+            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                eprintln!("Failed to write to socket: {}", e);
+                return;
+            }
+
+            println!("Sent: {:?}", encoded_response);
         }
-
-        println!("Sent: {:?}", encoded_response);
     }
 }
 
