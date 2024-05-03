@@ -22,7 +22,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     select,
     sync::mpsc::{self, Receiver, Sender},
-    time::interval,
+    time::{interval, sleep},
 };
 
 use chrono::Utc;
@@ -164,6 +164,8 @@ impl CommandHandler {
                 return;
             }
 
+            sleep(Duration::from_millis(5)).await;
+
             let encoded_response = encode_value(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
                 Value::BulkString("listening-port".to_string()),
@@ -174,6 +176,8 @@ impl CommandHandler {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
+
+            sleep(Duration::from_millis(5)).await;
 
             let encoded_response = encode_value(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
