@@ -2,7 +2,6 @@ use core::fmt;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::{Display, Formatter},
-    io::Read,
     time::Duration,
 };
 
@@ -437,7 +436,8 @@ impl CommandHandler {
                 if &replid == replid_str && offset == repl_offset.to_string() {
                     vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    let file = hex::decode(EMPTY_RDB).unwrap();
+                    let file = hex::decode(EMPTY_RDB).unwrap().escape_ascii().collect();
+
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
                         Value::RdbFile(file),
