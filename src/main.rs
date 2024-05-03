@@ -275,7 +275,7 @@ impl CommandHandler {
 
             match response {
                 Value::FullResync(_replid, _offset, _rdb) => {
-                    println!("Handshake complete");
+                    println!("Handshake complete with master");
                 }
                 _ => {
                     eprintln!("Failed to sync with master: invalid response");
