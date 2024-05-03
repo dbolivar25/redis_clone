@@ -80,7 +80,7 @@ enum Value {
 
 #[derive(Debug)]
 struct CommandHandler {
-    listen_addr: String,
+    listen_port: u16,
     server_type: ServerType,
     data: HashMap<Value, (Option<u128>, Value)>,
     expiration: BTreeMap<u128, Value>,
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         _ => unreachable!(),
     };
 
-    let (command_handler, msg_sender) = CommandHandler::new(bind_addr, server_type);
+    let (command_handler, msg_sender) = CommandHandler::new(args.port, server_type);
 
     tokio::spawn(command_handler.run());
 
@@ -137,12 +137,12 @@ impl Display for ServerType {
 }
 
 impl CommandHandler {
-    fn new(listen_addr: String, server_type: ServerType) -> (Self, Sender<Message>) {
+    fn new(listen_port: u16, server_type: ServerType) -> (Self, Sender<Message>) {
         let (msg_sender, msg_receiver) = mpsc::channel(256);
 
         (
             CommandHandler {
-                listen_addr,
+                listen_port,
                 server_type,
                 data: HashMap::new(),
                 expiration: BTreeMap::new(),
@@ -169,7 +169,7 @@ impl CommandHandler {
             let encoded_response = encode_value(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
                 Value::BulkString("listening-port".to_string()),
-                Value::BulkString(format!("{}", self.listen_addr)),
+                Value::BulkString(format!("{}", self.listen_port)),
             ]));
 
             if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
