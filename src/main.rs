@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 
+use itertools::{Either, Itertools};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take},
@@ -56,7 +57,7 @@ enum Command {
     Get(Value),
     Set(Value, Value, Option<u128>),
     Info(Value),
-    ReplConf(Value, Value),
+    ReplConf(Vec<(Value, Value)>),
     Psync(Value, Value),
 }
 
@@ -274,7 +275,7 @@ impl CommandHandler {
                         Command::Get(key) => self.handle_get(key),
                         Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
                         Command::Info(of_type) => self.handle_info(of_type),
-                        Command::ReplConf(_key, _value) => Value::SimpleString("OK".to_string()),
+                        Command::ReplConf(_pairs) => Value::SimpleString("OK".to_string()),
                         Command::Psync(replid, offset) => self.handle_psync(replid, offset),
                     };
 
@@ -623,19 +624,19 @@ fn parse_command(input: &[u8]) -> Result<Command> {
             }
         }
         "replconf" => {
-            let key = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing key for REPLCONF command"))?;
+            let (oks, errs): (Vec<_>, Vec<_>) = args.tuples().partition_map(|pair| {
+                if let (Value::BulkString(_), Value::BulkString(_)) = pair {
+                    Either::Left(pair)
+                } else {
+                    Either::Right(())
+                }
+            });
 
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing value for REPLCONF command"))?;
-
-            if args.next().is_some() {
-                Err(anyhow!("REPLCONF command takes exactly two arguments"))
-            } else {
-                Ok(Command::ReplConf(key, value))
+            if !errs.is_empty() {
+                return Err(anyhow!("Invalid REPLCONF option"));
             }
+
+            Ok(Command::ReplConf(oks))
         }
         "psync" => {
             let replid = args
