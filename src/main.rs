@@ -11,10 +11,10 @@ use itertools::{Either, Itertools};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take},
-    character::complete::{alphanumeric0, digit1},
+    character::complete::{alphanumeric0, alphanumeric1, digit1},
     combinator::{map, opt},
     multi::count,
-    sequence::{pair, preceded, terminated},
+    sequence::{pair, preceded, separated_pair, terminated},
     IResult,
 };
 
@@ -274,36 +274,14 @@ impl CommandHandler {
             };
 
             match response {
-                Value::SimpleString(s) => {
-                    let parts = s.split_whitespace().collect::<Vec<_>>();
-
-                    match parts.as_slice() {
-                        ["fullresync", replid, offset] => {
-                            println!("FULLRESYNC {} {}", replid, offset);
-
-                            let rdb_file = hex::decode(EMPTY_RDB).map_err(|e| anyhow!(e));
-
-                            let rdb_file = match rdb_file {
-                                Ok(rdb_file) => rdb_file,
-                                Err(e) => {
-                                    eprintln!("Failed to parse RDB file: {}", e);
-                                    return;
-                                }
-                            };
-
-                            println!("RDB file: {:?}", rdb_file);
-                        }
-                        ["continue"] => {
-                            println!("CONTINUE");
-                        }
-                        _ => {
-                            eprintln!("Invalid PSYNC response format");
-                            return;
-                        }
-                    }
+                Value::FullResync(replid, offset, rdb) => {
+                    println!(
+                        "Received full resync: replid={}, offset={}, rdb={}",
+                        replid, offset, rdb
+                    );
                 }
                 _ => {
-                    eprintln!("Invalid PSYNC response format");
+                    eprintln!("Failed to sync with master: invalid response");
                     return;
                 }
             }
@@ -722,6 +700,7 @@ fn parse_value(input: &[u8]) -> IResult<&[u8], Value> {
         parse_integer,
         parse_bulk_string,
         parse_array,
+        parse_full_resync,
     ))(input)
 }
 
@@ -739,6 +718,10 @@ fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], Value> {
 
 fn parse_array(input: &[u8]) -> IResult<&[u8], Value> {
     preceded(tag("*"), parse_array_impl)(input)
+}
+
+fn parse_full_resync(input: &[u8]) -> IResult<&[u8], Value> {
+    preceded(tag("+"), parse_full_resync_impl)(input)
 }
 
 fn parse_simple_string_impl(input: &[u8]) -> IResult<&[u8], Value> {
@@ -798,6 +781,40 @@ fn parse_array_impl(input: &[u8]) -> IResult<&[u8], Value> {
     let (input, values) = count(parse_value, len as usize)(input)?;
 
     Ok((input, Value::Array(values)))
+}
+
+fn parse_full_resync_impl(input: &[u8]) -> IResult<&[u8], Value> {
+    match separated_pair(
+        pair(
+            preceded(tag("FULLRESYNC "), alphanumeric1),
+            preceded(tag(" "), alphanumeric1),
+        ),
+        parse_crlf,
+        preceded(tag("$"), parse_integer_impl),
+    )(input)
+    {
+        Ok((input, ((replid, offset), rdb_len))) => {
+            let replid = String::from_utf8_lossy(replid).to_string();
+            let offset = String::from_utf8_lossy(offset).to_string();
+
+            let rdb_len = match rdb_len {
+                Value::Integer(len) if len >= 0 => len as usize,
+                _ => {
+                    return Err(nom::Err::Failure(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Tag,
+                    )))
+                }
+            };
+
+            let (input, rdb) = map(take(rdb_len), |s: &[u8]| {
+                String::from_utf8_lossy(s).to_string()
+            })(input)?;
+
+            Ok((input, Value::FullResync(replid, offset, rdb)))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
