@@ -2,6 +2,7 @@ use core::fmt;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::{Display, Formatter},
+    io::Read,
     time::Duration,
 };
 
@@ -77,7 +78,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    RdbFile(String),
+    RdbFile(Vec<u8>),
     Null,
 }
 
@@ -439,7 +440,7 @@ impl CommandHandler {
                     let file = hex::decode(EMPTY_RDB).unwrap();
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
-                        Value::RdbFile(String::from_utf8_lossy(&file).to_string()),
+                        Value::RdbFile(file),
                     ]
                 }
             }
@@ -578,7 +579,9 @@ fn encode_value(val: &Value) -> String {
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
         Value::RdbFile(rdb) => {
-            format!("${}\r\n{}", rdb.len(), rdb)
+            let rdb_file = rdb.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+            format!("${}\r\n{}", rdb_file.len(), rdb_file)
         }
         Value::Null => "_\r\n".to_string(),
     }
@@ -829,10 +832,7 @@ fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
     let (input, values) = take(len as usize)(input)?;
 
-    Ok((
-        input,
-        Value::RdbFile(String::from_utf8_lossy(values).to_string()),
-    ))
+    Ok((input, Value::RdbFile(values.to_vec())))
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
