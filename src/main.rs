@@ -1,5 +1,7 @@
+use core::fmt;
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt::{Display, Formatter},
     time::Duration,
 };
 
@@ -35,6 +37,16 @@ struct Args {
     /// Port to listen on
     #[clap(short, long, default_value = "6379")]
     port: u16,
+
+    /// Host and port of the master server
+    #[clap(short, long, num_args = 2)]
+    replicaof: Vec<String>,
+}
+
+#[derive(Debug)]
+enum ServerType {
+    Master(u32),
+    Slave(String, String),
 }
 
 #[derive(Debug)]
@@ -67,6 +79,7 @@ enum Value {
 
 #[derive(Debug)]
 struct CommandHandler {
+    server_type: ServerType,
     data: HashMap<Value, (Option<u128>, Value)>,
     expiration: BTreeMap<u128, Value>,
     msg_receiver: Receiver<Message>,
@@ -89,7 +102,13 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     println!("Listening on {}", listener.local_addr()?);
 
-    let (command_handler, msg_sender) = CommandHandler::new();
+    let server_type = match args.replicaof.as_slice() {
+        [] => ServerType::Master(0),
+        [host, port] => ServerType::Slave(host.clone(), port.clone()),
+        _ => unreachable!(),
+    };
+
+    let (command_handler, msg_sender) = CommandHandler::new(server_type);
 
     tokio::spawn(command_handler.run());
 
@@ -102,12 +121,22 @@ async fn main() -> Result<()> {
     }
 }
 
+impl Display for ServerType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            ServerType::Master(_count) => write!(f, "master"),
+            ServerType::Slave(_host, _port) => write!(f, "slave"),
+        }
+    }
+}
+
 impl CommandHandler {
-    fn new() -> (Self, Sender<Message>) {
+    fn new(server_type: ServerType) -> (Self, Sender<Message>) {
         let (msg_sender, msg_receiver) = mpsc::channel(256);
 
         (
             CommandHandler {
+                server_type,
                 data: HashMap::new(),
                 expiration: BTreeMap::new(),
                 msg_receiver,
@@ -188,9 +217,18 @@ impl CommandHandler {
     fn handle_info(&self, of_type: Value) -> Value {
         match of_type {
             Value::BulkString(s) => {
-                let info = match s.as_str() {
-                    "replication" => vec!["role:master", "connected_slaves:0"],
-                    _ => vec!["DEFAULT INFO"],
+                let info = match s.to_lowercase().as_str() {
+                    "replication" => vec![
+                        format!("role:{}", self.server_type),
+                        format!(
+                            "connected_slaves:{}",
+                            match self.server_type {
+                                ServerType::Master(count) => count,
+                                ServerType::Slave(_, _) => 0,
+                            }
+                        ),
+                    ],
+                    _ => vec!["DEFAULT INFO".to_string()],
                 };
 
                 Value::BulkString(info.join("\n"))
