@@ -10,10 +10,10 @@ use anyhow::{anyhow, Result};
 use itertools::{Either, Itertools};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take},
+    bytes::complete::{tag, take, take_till, take_until},
     character::complete::{alphanumeric0, alphanumeric1, digit1},
     combinator::{map, opt},
-    multi::count,
+    multi::{count, many_till},
     sequence::{pair, preceded, separated_pair, terminated},
     IResult,
 };
@@ -77,7 +77,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    FullResync(String, String, String),
+    RdbFile(String),
     Null,
 }
 
@@ -265,7 +265,7 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
-            let (_remaining, response) = match parse_value(received_data) {
+            let (remaining, response) = match parse_simple_string(received_data) {
                 Ok(res) => res,
                 Err(e) => {
                     eprintln!("Failed to parse response: {}", e);
@@ -273,12 +273,48 @@ impl CommandHandler {
                 }
             };
 
+            dbg!(&response);
+
             match response {
-                Value::FullResync(_replid, _offset, _rdb) => {
-                    println!("Handshake complete with master");
+                Value::SimpleString(s) => {
+                    let parts = s.split_whitespace().collect::<Vec<_>>();
+                    dbg!("HERE");
+                    match parts.as_slice() {
+                        [msg] if msg.to_lowercase().as_str() == "continue" => {}
+                        [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) => {
+                                    println!("Connection closed");
+                                    return;
+                                }
+                                Ok(n) => n,
+                                Err(e) => {
+                                    eprintln!("Failed to read from socket: {}", e);
+                                    return;
+                                }
+                            };
+
+                            let received = &buf[..n];
+                            println!("Received: {:?}", String::from_utf8_lossy(received));
+
+                            let (_remaining, response) = match parse_rdb_file(received) {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    eprintln!("Failed to parse response: {}", e);
+                                    return;
+                                }
+                            };
+
+                            println!("RDB file: {:?}", response);
+                        }
+                        _ => {
+                            eprintln!("Invalid response: {}", s);
+                            return;
+                        }
+                    }
                 }
                 _ => {
-                    eprintln!("Failed to sync with master: invalid response");
+                    eprintln!("Invalid response type");
                     return;
                 }
             }
@@ -290,19 +326,22 @@ impl CommandHandler {
                     self.handle_expired_keys();
                 }
                 Some(message) = self.msg_receiver.recv() => {
-                    let response = match message.command {
+                    let responses = match message.command {
                         Command::Ping => self.handle_ping(),
                         Command::Echo(value) => self.handle_echo(value),
                         Command::Get(key) => self.handle_get(key),
                         Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
                         Command::Info(of_type) => self.handle_info(of_type),
-                        Command::ReplConf(_pairs) => Value::SimpleString("OK".to_string()),
+                        Command::ReplConf(_pairs) => vec![Value::SimpleString("OK".to_string())],
                         Command::Psync(replid, offset) => self.handle_psync(replid, offset),
                     };
 
                     if let Some(response_sender) = message.response_sender {
-                        if let Err(e) = response_sender.send(response).await {
-                            eprintln!("Failed to send response: {}", e);
+                        for response in responses {
+                            dbg!(&response);
+                            if let Err(e) = response_sender.send(response).await {
+                                eprintln!("Failed to send response: {}", e);
+                            }
                         }
                     }
                 }
@@ -310,18 +349,18 @@ impl CommandHandler {
         }
     }
 
-    fn handle_ping(&self) -> Value {
-        Value::SimpleString("PONG".to_string())
+    fn handle_ping(&self) -> Vec<Value> {
+        vec![Value::SimpleString("PONG".to_string())]
     }
 
-    fn handle_echo(&self, value: Value) -> Value {
-        value
+    fn handle_echo(&self, value: Value) -> Vec<Value> {
+        vec![value]
     }
 
-    fn handle_get(&mut self, key: Value) -> Value {
+    fn handle_get(&mut self, key: Value) -> Vec<Value> {
         let (expiration, value) = match self.data.get(&key) {
             Some(pair) => pair,
-            None => return Value::NullBulkString,
+            None => return vec![Value::NullBulkString],
         };
 
         if let &Some(expiration) = expiration {
@@ -330,14 +369,14 @@ impl CommandHandler {
                 self.data.remove(&key);
                 self.expiration.remove(&expiration);
 
-                return Value::NullBulkString;
+                return vec![Value::NullBulkString];
             }
         }
 
-        value.clone()
+        vec![value.clone()]
     }
 
-    fn handle_set(&mut self, key: Value, value: Value, expiration: Option<u128>) -> Value {
+    fn handle_set(&mut self, key: Value, value: Value, expiration: Option<u128>) -> Vec<Value> {
         let expiration_time = expiration.map(|val| {
             let now = Utc::now().timestamp_millis() as u128;
             now + val
@@ -349,10 +388,10 @@ impl CommandHandler {
             self.expiration.insert(expiration_time, key);
         }
 
-        Value::SimpleString("OK".to_string())
+        vec![Value::SimpleString("OK".to_string())]
     }
 
-    fn handle_info(&self, of_type: Value) -> Value {
+    fn handle_info(&self, of_type: Value) -> Vec<Value> {
         match of_type {
             Value::BulkString(s) => {
                 let info = match s.to_lowercase().as_str() {
@@ -379,36 +418,36 @@ impl CommandHandler {
                     _ => vec!["DEFAULT INFO".to_string()],
                 };
 
-                Value::BulkString(info.join("\n"))
+                vec![Value::BulkString(info.join("\n"))]
             }
-            _ => Value::SimpleError("Invalid INFO subcommand string format".to_string()),
+            _ => vec![Value::SimpleError("Invalid INFO type".to_string())],
         }
     }
 
-    fn handle_psync(&self, replid: Value, offset: Value) -> Value {
+    fn handle_psync(&self, replid: Value, offset: Value) -> Vec<Value> {
         let replid = match replid {
             Value::BulkString(s) => s,
-            _ => return Value::SimpleError("Invalid REPLID type".to_string()),
+            _ => return vec![Value::SimpleError("Invalid REPLID type".to_string())],
         };
 
         let offset = match offset {
             Value::BulkString(s) => s,
-            _ => return Value::SimpleError("Invalid OFFSET type".to_string()),
+            _ => return vec![Value::SimpleError("Invalid OFFSET type".to_string())],
         };
 
         match &self.server_type {
             ServerType::Master(_, replid_str, repl_offset) => {
                 if &replid == replid_str && offset == repl_offset.to_string() {
-                    Value::SimpleString("CONTINUE".to_string())
+                    vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    Value::FullResync(
-                        replid_str.clone(),
-                        repl_offset.to_string(),
-                        EMPTY_RDB.to_string(),
-                    )
+                    let file = hex::decode(EMPTY_RDB).unwrap();
+                    vec![
+                        Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
+                        Value::RdbFile(String::from_utf8_lossy(&file).to_string()),
+                    ]
                 }
             }
-            ServerType::Slave(_) => Value::SimpleString("CONTINUE".to_string()),
+            ServerType::Slave(_) => vec![Value::SimpleString("CONTINUE".to_string())],
         }
     }
 
@@ -429,7 +468,7 @@ impl CommandHandler {
 
 impl MsgSender {
     async fn send_command(&self, command: Command) -> Result<Value> {
-        let (response_sender, mut response_receiver) = mpsc::channel(1);
+        let (response_sender, mut response_receiver) = mpsc::channel(2);
 
         let message = Message {
             command,
@@ -537,14 +576,8 @@ fn encode_value(val: &Value) -> String {
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
-        Value::FullResync(replid, offset, rdb) => {
-            format!(
-                "+FULLRESYNC {} {}\r\n${}\r\n{}",
-                replid,
-                offset,
-                rdb.len(),
-                rdb
-            )
+        Value::RdbFile(rdb) => {
+            format!("${}\r\n{}", rdb.len(), rdb)
         }
         Value::Null => "_\r\n".to_string(),
     }
@@ -697,7 +730,7 @@ fn parse_value(input: &[u8]) -> IResult<&[u8], Value> {
         parse_integer,
         parse_bulk_string,
         parse_array,
-        parse_full_resync,
+        parse_rdb_file,
     ))(input)
 }
 
@@ -717,12 +750,12 @@ fn parse_array(input: &[u8]) -> IResult<&[u8], Value> {
     preceded(tag("*"), parse_array_impl)(input)
 }
 
-fn parse_full_resync(input: &[u8]) -> IResult<&[u8], Value> {
-    preceded(tag("+"), parse_full_resync_impl)(input)
+fn parse_rdb_file(input: &[u8]) -> IResult<&[u8], Value> {
+    preceded(tag("$"), parse_rdb_file_impl)(input)
 }
 
 fn parse_simple_string_impl(input: &[u8]) -> IResult<&[u8], Value> {
-    map(terminated(alphanumeric0, parse_crlf), |s| {
+    map(terminated(take_until("\r\n"), parse_crlf), |s| {
         Value::SimpleString(String::from_utf8_lossy(s).to_string())
     })(input)
 }
@@ -780,38 +813,25 @@ fn parse_array_impl(input: &[u8]) -> IResult<&[u8], Value> {
     Ok((input, Value::Array(values)))
 }
 
-fn parse_full_resync_impl(input: &[u8]) -> IResult<&[u8], Value> {
-    match separated_pair(
-        pair(
-            preceded(tag("FULLRESYNC "), alphanumeric1),
-            preceded(tag(" "), alphanumeric1),
-        ),
-        parse_crlf,
-        preceded(tag("$"), parse_integer_impl),
-    )(input)
-    {
-        Ok((input, ((replid, offset), rdb_len))) => {
-            let replid = String::from_utf8_lossy(replid).to_string();
-            let offset = String::from_utf8_lossy(offset).to_string();
+fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
+    let (input, val) = parse_integer_impl(input)?;
 
-            let rdb_len = match rdb_len {
-                Value::Integer(len) if len >= 0 => len as usize,
-                _ => {
-                    return Err(nom::Err::Failure(nom::error::Error::new(
-                        input,
-                        nom::error::ErrorKind::Tag,
-                    )))
-                }
-            };
-
-            let (input, rdb) = map(take(rdb_len), |s: &[u8]| {
-                String::from_utf8_lossy(s).to_string()
-            })(input)?;
-
-            Ok((input, Value::FullResync(replid, offset, rdb)))
+    let len = match val {
+        Value::Integer(len) if len >= 0 => len,
+        _ => {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )))
         }
-        Err(e) => Err(e),
-    }
+    };
+
+    let (input, values) = take(len as usize)(input)?;
+
+    Ok((
+        input,
+        Value::RdbFile(String::from_utf8_lossy(values).to_string()),
+    ))
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
