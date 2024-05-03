@@ -77,6 +77,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
+    FullResync(String, String, String),
     Null,
 }
 
@@ -97,6 +98,8 @@ struct Context {
     stream: TcpStream,
     msg_sender: MsgSender,
 }
+
+const EMPTY_RDB: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -261,6 +264,49 @@ impl CommandHandler {
 
             let received_data = &buf[..n];
             println!("Received: {:?}", String::from_utf8_lossy(received_data));
+
+            let (remaining, response) = match parse_value(received_data) {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("Failed to parse response: {}", e);
+                    return;
+                }
+            };
+
+            match response {
+                Value::SimpleString(s) => {
+                    let parts = s.split_whitespace().collect::<Vec<_>>();
+
+                    match parts.as_slice() {
+                        ["fullresync", replid, offset] => {
+                            println!("FULLRESYNC {} {}", replid, offset);
+
+                            let rdb_file = hex::decode(EMPTY_RDB).map_err(|e| anyhow!(e));
+
+                            let rdb_file = match rdb_file {
+                                Ok(rdb_file) => rdb_file,
+                                Err(e) => {
+                                    eprintln!("Failed to parse RDB file: {}", e);
+                                    return;
+                                }
+                            };
+
+                            println!("RDB file: {:?}", rdb_file);
+                        }
+                        ["continue"] => {
+                            println!("CONTINUE");
+                        }
+                        _ => {
+                            eprintln!("Invalid PSYNC response format");
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("Invalid PSYNC response format");
+                    return;
+                }
+            }
         }
 
         loop {
@@ -378,9 +424,13 @@ impl CommandHandler {
         match &self.server_type {
             ServerType::Master(_, replid_str, repl_offset) => {
                 if &replid == replid_str && offset == repl_offset.to_string() {
-                    Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, 0))
+                    Value::SimpleString("CONTINUE".to_string())
                 } else {
-                    Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, 0))
+                    Value::FullResync(
+                        replid_str.clone(),
+                        repl_offset.to_string(),
+                        EMPTY_RDB.to_string(),
+                    )
                 }
             }
             ServerType::Slave(_) => Value::SimpleString("CONTINUE".to_string()),
@@ -512,6 +562,9 @@ fn encode_value(val: &Value) -> String {
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
+        Value::FullResync(replid, offset, rdb) => {
+            format!("+FULLRESYNC {} {}\r\n{}", replid, offset, rdb)
+        }
         Value::Null => "_\r\n".to_string(),
     }
 }
