@@ -22,7 +22,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     select,
     sync::mpsc::{self, Receiver, Sender},
-    time::{interval, sleep},
+    time::interval,
 };
 
 use chrono::Utc;
@@ -57,6 +57,7 @@ enum Command {
     Set(Value, Value, Option<u128>),
     Info(Value),
     ReplConf(Value, Value),
+    Psync(Value, Value),
 }
 
 #[derive(Debug)]
@@ -108,7 +109,6 @@ async fn main() -> Result<()> {
         [] => ServerType::Master(0, "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), 0),
         [host, port] => {
             let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
-
             ServerType::Slave(stream)
         }
         _ => unreachable!(),
@@ -156,6 +156,8 @@ impl CommandHandler {
         let mut gc_interval = interval(Duration::from_secs(1));
 
         if let ServerType::Slave(ref mut stream) = self.server_type {
+            let mut buf = [0; 1024];
+
             let encoded_response =
                 encode_value(&Value::Array(vec![Value::BulkString("PING".to_string())]));
 
@@ -164,7 +166,20 @@ impl CommandHandler {
                 return;
             }
 
-            sleep(Duration::from_millis(5)).await;
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    println!("Connection closed");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to read from socket: {}", e);
+                    return;
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
             let encoded_response = encode_value(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
@@ -177,10 +192,25 @@ impl CommandHandler {
                 return;
             }
 
-            sleep(Duration::from_millis(5)).await;
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    println!("Connection closed");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to read from socket: {}", e);
+                    return;
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
             let encoded_response = encode_value(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
+                Value::BulkString("capa".to_string()),
+                Value::BulkString("eof".to_string()),
                 Value::BulkString("capa".to_string()),
                 Value::BulkString("psync2".to_string()),
             ]));
@@ -189,6 +219,47 @@ impl CommandHandler {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
+
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    println!("Connection closed");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to read from socket: {}", e);
+                    return;
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {:?}", String::from_utf8_lossy(received_data));
+
+            let encoded_response = encode_value(&Value::Array(vec![
+                Value::BulkString("PSYNC".to_string()),
+                Value::BulkString("?".to_string()),
+                Value::BulkString("-1".to_string()),
+            ]));
+
+            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                eprintln!("Failed to write to socket: {}", e);
+                return;
+            }
+
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    println!("Connection closed");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to read from socket: {}", e);
+                    return;
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {:?}", String::from_utf8_lossy(received_data));
         }
 
         loop {
@@ -204,6 +275,7 @@ impl CommandHandler {
                         Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
                         Command::Info(of_type) => self.handle_info(of_type),
                         Command::ReplConf(_key, _value) => Value::SimpleString("OK".to_string()),
+                        Command::Psync(replid, offset) => self.handle_psync(replid, offset),
                     };
 
                     if let Some(response_sender) = message.response_sender {
@@ -288,6 +360,29 @@ impl CommandHandler {
                 Value::BulkString(info.join("\n"))
             }
             _ => Value::SimpleError("Invalid INFO subcommand string format".to_string()),
+        }
+    }
+
+    fn handle_psync(&self, replid: Value, offset: Value) -> Value {
+        let replid = match replid {
+            Value::BulkString(s) => s,
+            _ => return Value::SimpleError("Invalid REPLID type".to_string()),
+        };
+
+        let offset = match offset {
+            Value::BulkString(s) => s,
+            _ => return Value::SimpleError("Invalid OFFSET type".to_string()),
+        };
+
+        match &self.server_type {
+            ServerType::Master(_, replid_str, repl_offset) => {
+                if &replid == replid_str && offset == repl_offset.to_string() {
+                    Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, 0))
+                } else {
+                    Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, 0))
+                }
+            }
+            ServerType::Slave(_) => Value::SimpleString("CONTINUE".to_string()),
         }
     }
 
@@ -424,7 +519,7 @@ fn parse_command(input: &[u8]) -> Result<Command> {
     let (_, array) = parse_array(input).map_err(|_| anyhow!("Failed to parse array"))?;
     let mut args = match array {
         Value::Array(args) => args.into_iter(),
-        _ => unreachable!(),
+        _ => return Err(anyhow!("Invalid command format: expected an Array")),
     };
 
     let command_value = args.next().ok_or_else(|| anyhow!("Empty command"))?;
@@ -477,7 +572,11 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                             Some(Value::BulkString(expiration)) => {
                                 Some(expiration.parse::<u128>()? * 1000)
                             }
-                            Some(_) => return Err(anyhow!("Invalid expiration time")),
+                            Some(_) => {
+                                return Err(anyhow!(
+                                    "Invalid expiration type: expected a BulkString"
+                                ))
+                            }
                             None => None,
                         };
 
@@ -492,7 +591,11 @@ fn parse_command(input: &[u8]) -> Result<Command> {
                             Some(Value::BulkString(expiration)) => {
                                 Some(expiration.parse::<u128>()?)
                             }
-                            Some(_) => return Err(anyhow!("Invalid expiration time")),
+                            Some(_) => {
+                                return Err(anyhow!(
+                                    "Invalid expiration type: expected a BulkString"
+                                ))
+                            }
                             None => None,
                         };
 
