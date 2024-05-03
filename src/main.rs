@@ -45,7 +45,7 @@ struct Args {
 
 #[derive(Debug)]
 enum ServerType {
-    Master(u32),
+    Master(u32, String, u128),
     Slave(String, String),
 }
 
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
     println!("Listening on {}", listener.local_addr()?);
 
     let server_type = match args.replicaof.as_slice() {
-        [] => ServerType::Master(0),
+        [] => ServerType::Master(0, "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), 0),
         [host, port] => ServerType::Slave(host.clone(), port.clone()),
         _ => unreachable!(),
     };
@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
 impl Display for ServerType {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            ServerType::Master(_count) => write!(f, "master"),
+            ServerType::Master(_count, _replid, _repl_offset) => write!(f, "master"),
             ServerType::Slave(_host, _port) => write!(f, "slave"),
         }
     }
@@ -218,16 +218,26 @@ impl CommandHandler {
         match of_type {
             Value::BulkString(s) => {
                 let info = match s.to_lowercase().as_str() {
-                    "replication" => vec![
-                        format!("role:{}", self.server_type),
-                        format!(
-                            "connected_slaves:{}",
-                            match self.server_type {
-                                ServerType::Master(count) => count,
-                                ServerType::Slave(_, _) => 0,
+                    "replication" => {
+                        let role = match &self.server_type {
+                            ServerType::Master(_, _, _) => "master",
+                            ServerType::Slave(_, _) => "slave",
+                        };
+
+                        let (replid, repl_offset) = match &self.server_type {
+                            ServerType::Master(_, replid, repl_offset) => {
+                                (replid.as_str(), repl_offset)
                             }
-                        ),
-                    ],
+                            ServerType::Slave(_, _) => ("0", &0),
+                        };
+
+                        vec![
+                            format!("role:{}", role),
+                            format!("master_replid:{}", replid),
+                            format!("master_repl_offset:{}", repl_offset),
+                        ]
+                    }
+
                     _ => vec!["DEFAULT INFO".to_string()],
                 };
 
