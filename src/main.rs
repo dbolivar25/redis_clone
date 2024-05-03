@@ -563,7 +563,13 @@ fn encode_value(val: &Value) -> String {
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
         Value::FullResync(replid, offset, rdb) => {
-            format!("+FULLRESYNC {} {}\r\n{}", replid, offset, rdb)
+            format!(
+                "+FULLRESYNC {} {}\r\n${}\r\n{}",
+                replid,
+                offset,
+                rdb.len(),
+                rdb
+            )
         }
         Value::Null => "_\r\n".to_string(),
     }
