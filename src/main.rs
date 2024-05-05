@@ -442,15 +442,15 @@ impl CommandHandler {
                 if &replid == replid_str && offset == repl_offset.to_string() {
                     vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    // let file = hex::decode(EMPTY_RDB_HEX)
-                    //     .unwrap()
-                    //     .escape_ascii()
-                    //     .map(|c| c as char)
-                    //     .collect();
+                    let file = hex::decode(EMPTY_RDB_HEX)
+                        .unwrap()
+                        .escape_ascii()
+                        .map(|c| c as char)
+                        .collect();
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
-                        Value::RdbFile(EMPTY_RDB.to_string()),
+                        Value::RdbFile(file),
                     ]
                 }
             }
