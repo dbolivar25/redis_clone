@@ -77,7 +77,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    RdbFile(Vec<u8>),
+    RdbFile(String),
     Null,
 }
 
@@ -99,7 +99,8 @@ struct Context {
     msg_sender: MsgSender,
 }
 
-const EMPTY_RDB: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+const EMPTY_RDB_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+const EMPTY_RDB: &str = "REDIS0007\x00\x00\x00\x00\x00\x00\x00\x00";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -265,7 +266,7 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {:?}", String::from_utf8_lossy(received_data));
 
-            let (_remaining, response) = match parse_simple_string(received_data) {
+            let (remaining, response) = match parse_simple_string(received_data) {
                 Ok(res) => res,
                 Err(e) => {
                     eprintln!("Failed to parse response: {}", e);
@@ -279,22 +280,25 @@ impl CommandHandler {
                     match parts.as_slice() {
                         [msg] if msg.to_lowercase().as_str() == "continue" => {}
                         [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
-                            let n = match stream.read(&mut buf).await {
-                                Ok(0) => {
-                                    println!("Connection closed");
-                                    return;
-                                }
-                                Ok(n) => n,
-                                Err(e) => {
-                                    eprintln!("Failed to read from socket: {}", e);
-                                    return;
-                                }
+                            let received = if remaining.is_empty() {
+                                let n = match stream.read(&mut buf).await {
+                                    Ok(0) => {
+                                        println!("Connection closed");
+                                        return;
+                                    }
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        eprintln!("Failed to read from socket: {}", e);
+                                        return;
+                                    }
+                                };
+
+                                &buf[..n]
+                            } else {
+                                remaining
                             };
 
-                            let received = &buf[..n];
-                            println!("Received: {:?}", String::from_utf8_lossy(received));
-
-                            let (_remaining, response) = match parse_rdb_file(received) {
+                            let (_remaining, _response) = match parse_rdb_file(received) {
                                 Ok(res) => res,
                                 Err(e) => {
                                     eprintln!("Failed to parse response: {}", e);
@@ -302,7 +306,9 @@ impl CommandHandler {
                                 }
                             };
 
-                            println!("RDB file: {:?}", response);
+                            if let Value::RdbFile(_) = _response {
+                                println!("Completed handshake with master");
+                            }
                         }
                         _ => {
                             eprintln!("Invalid response: {}", s);
@@ -436,11 +442,15 @@ impl CommandHandler {
                 if &replid == replid_str && offset == repl_offset.to_string() {
                     vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    let file = hex::decode(EMPTY_RDB).unwrap().escape_ascii().collect();
+                    // let file = hex::decode(EMPTY_RDB_HEX)
+                    //     .unwrap()
+                    //     .escape_ascii()
+                    //     .map(|c| c as char)
+                    //     .collect();
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
-                        Value::RdbFile(file),
+                        Value::RdbFile(EMPTY_RDB.to_string()),
                     ]
                 }
             }
@@ -578,9 +588,7 @@ fn encode_value(val: &Value) -> String {
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
-        Value::RdbFile(rdb) => {
-            let rdb_file = rdb.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-
+        Value::RdbFile(rdb_file) => {
             format!("${}\r\n{}", rdb_file.len(), rdb_file)
         }
         Value::Null => "_\r\n".to_string(),
@@ -832,7 +840,10 @@ fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
     let (input, values) = take(len as usize)(input)?;
 
-    Ok((input, Value::RdbFile(values.to_vec())))
+    Ok((
+        input,
+        Value::RdbFile(values.iter().map(|&c| c as char).collect()),
+    ))
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
