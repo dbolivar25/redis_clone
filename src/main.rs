@@ -1,5 +1,6 @@
 use core::fmt;
 use std::{
+    char,
     collections::{BTreeMap, HashMap},
     fmt::{Display, Formatter},
     time::Duration,
@@ -77,7 +78,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    RdbFile(usize, String),
+    RdbFile(Vec<u8>),
     Null,
 }
 
@@ -443,18 +444,9 @@ impl CommandHandler {
                 } else {
                     let decoded = hex::decode(EMPTY_RDB_HEX).unwrap();
 
-                    let len = EMPTY_RDB_HEX.len() / 2;
-                    let file = decoded
-                        .escape_ascii()
-                        .map(|c| c as char)
-                        .collect::<String>()
-                        .replace("\\", [134 as char].iter().collect::<String>().as_str());
-
-                    dbg!(&file);
-
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
-                        Value::RdbFile(len, file),
+                        Value::RdbFile(decoded),
                     ]
                 }
             }
@@ -566,14 +558,30 @@ async fn handle_connection(context: Context) {
         };
 
         for response in responses {
-            let encoded_response = encode_value(&response);
+            if let Value::RdbFile(rdb_file) = &response {
+                let header = format!("${}\r\n", rdb_file.len());
 
-            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
-                eprintln!("Failed to write to socket: {}", e);
-                return;
+                if let Err(e) = stream.write_all(header.as_bytes()).await {
+                    eprintln!("Failed to write to socket: {}", e);
+                    return;
+                }
+
+                println!("Sent: {:?}", header);
+
+                if let Err(e) = stream.write_all(rdb_file).await {
+                    eprintln!("Failed to write to socket: {}", e);
+                    return;
+                }
+            } else {
+                let encoded_response = encode_value(&response);
+
+                if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                    eprintln!("Failed to write to socket: {}", e);
+                    return;
+                }
+
+                println!("Sent: {:?}", encoded_response);
             }
-
-            println!("Sent: {:?}", encoded_response);
         }
     }
 }
@@ -592,8 +600,8 @@ fn encode_value(val: &Value) -> String {
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
-        Value::RdbFile(_len, rdb_file) => {
-            format!("${}\r\n{}", _len, rdb_file)
+        Value::RdbFile(rdb_file) => {
+            format!("${}\r\n", rdb_file.len())
         }
         Value::Null => "_\r\n".to_string(),
     }
@@ -844,10 +852,7 @@ fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
     let (input, values) = take(len as usize)(input)?;
 
-    Ok((
-        input,
-        Value::RdbFile(len as usize, values.iter().map(|&c| c as char).collect()),
-    ))
+    Ok((input, Value::RdbFile(values.to_vec())))
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
