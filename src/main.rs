@@ -1,6 +1,5 @@
 use core::fmt;
 use std::{
-    char,
     collections::{BTreeMap, HashMap},
     fmt::{Display, Formatter},
     time::Duration,
@@ -166,7 +165,7 @@ impl CommandHandler {
             let encoded_response =
                 encode_value(&Value::Array(vec![Value::BulkString("PING".to_string())]));
 
-            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+            if let Err(e) = stream.write_all(&encoded_response).await {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
@@ -192,7 +191,7 @@ impl CommandHandler {
                 Value::BulkString(format!("{}", self.listen_port)),
             ]));
 
-            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+            if let Err(e) = stream.write_all(&encoded_response).await {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
@@ -220,7 +219,7 @@ impl CommandHandler {
                 Value::BulkString("psync2".to_string()),
             ]));
 
-            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+            if let Err(e) = stream.write_all(&encoded_response).await {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
@@ -246,7 +245,7 @@ impl CommandHandler {
                 Value::BulkString("-1".to_string()),
             ]));
 
-            if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+            if let Err(e) = stream.write_all(&encoded_response).await {
                 eprintln!("Failed to write to socket: {}", e);
                 return;
             }
@@ -527,7 +526,7 @@ async fn handle_connection(context: Context) {
                 let response = Value::SimpleError(e.to_string());
                 let encoded_response = encode_value(&response);
 
-                if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                if let Err(e) = stream.write_all(&encoded_response).await {
                     eprintln!("Failed to write to socket: {}", e);
                     return;
                 }
@@ -546,7 +545,7 @@ async fn handle_connection(context: Context) {
                 let response = Value::SimpleError(e.to_string());
                 let encoded_response = encode_value(&response);
 
-                if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                if let Err(e) = stream.write_all(&encoded_response).await {
                     eprintln!("Failed to write to socket: {}", e);
                     return;
                 }
@@ -566,8 +565,6 @@ async fn handle_connection(context: Context) {
                     return;
                 }
 
-                println!("Sent: {:?}", header);
-
                 if let Err(e) = stream.write_all(rdb_file).await {
                     eprintln!("Failed to write to socket: {}", e);
                     return;
@@ -575,7 +572,7 @@ async fn handle_connection(context: Context) {
             } else {
                 let encoded_response = encode_value(&response);
 
-                if let Err(e) = stream.write_all(encoded_response.as_bytes()).await {
+                if let Err(e) = stream.write_all(&encoded_response).await {
                     eprintln!("Failed to write to socket: {}", e);
                     return;
                 }
@@ -586,24 +583,28 @@ async fn handle_connection(context: Context) {
     }
 }
 
-fn encode_value(val: &Value) -> String {
+fn encode_value(val: &Value) -> Vec<u8> {
     match val {
-        Value::SimpleString(s) => format!("+{}\r\n", s),
-        Value::SimpleError(s) => format!("-{}\r\n", s),
-        Value::Integer(i) => format!(":{}\r\n", i),
-        Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
+        Value::SimpleString(s) => format!("+{}\r\n", s).into_bytes(),
+        Value::SimpleError(s) => format!("-{}\r\n", s).into_bytes(),
+        Value::Integer(i) => format!(":{}\r\n", i).into_bytes(),
+        Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s).into_bytes(),
         Value::Array(vals) => {
             let n = vals.len();
-            let body = vals.iter().map(encode_value).collect::<String>();
+            let body = vals.iter().map(encode_value).flatten();
 
-            format!("*{}\r\n{}", n, body)
+            let mut res = format!("*{}\r\n", n).into_bytes();
+            res.extend(body);
+            res
         }
-        Value::NullBulkString => "$-1\r\n".to_string(),
-        Value::NullArray => "*-1\r\n".to_string(),
+        Value::NullBulkString => b"$-1\r\n".to_vec(),
+        Value::NullArray => b"*-1\r\n".to_vec(),
         Value::RdbFile(rdb_file) => {
-            format!("${}\r\n", rdb_file.len())
+            let mut res = format!("${}\r\n", rdb_file.len()).into_bytes();
+            res.extend(rdb_file);
+            res
         }
-        Value::Null => "_\r\n".to_string(),
+        Value::Null => b"_\r\n".to_vec(),
     }
 }
 
