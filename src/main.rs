@@ -99,7 +99,7 @@ struct Context {
     msg_sender: MsgSender,
 }
 
-const EMPTY_RDB_HEX: &str = "524544495330303033FF";
+const EMPTY_RDB_HEX: &str = "524544495330303033FF0000000000000000";
 
 #[tokio::main]
 async fn main() -> Result<()> {
