@@ -444,7 +444,7 @@ impl CommandHandler {
                     let decoded = hex::decode(EMPTY_RDB_HEX).unwrap();
 
                     let len = decoded.len();
-                    let file = decoded.escape_ascii().map(|c| c as char).collect();
+                    let file = decoded.iter().map(|&c| c as char).collect();
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
@@ -586,8 +586,8 @@ fn encode_value(val: &Value) -> String {
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
-        Value::RdbFile(len, rdb_file) => {
-            format!("${}\r\n{}", len, rdb_file)
+        Value::RdbFile(_len, rdb_file) => {
+            format!("${}\r\n{}", rdb_file.len(), rdb_file)
         }
         Value::Null => "_\r\n".to_string(),
     }
