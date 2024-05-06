@@ -99,7 +99,7 @@ struct Context {
     msg_sender: MsgSender,
 }
 
-const EMPTY_RDB_HEX: &str = "524544495330303033FF0000000000000000";
+const EMPTY_RDB_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -444,7 +444,13 @@ impl CommandHandler {
                     let decoded = hex::decode(EMPTY_RDB_HEX).unwrap();
 
                     let len = EMPTY_RDB_HEX.len() / 2;
-                    let file = decoded.escape_ascii().map(|c| c as char).collect();
+                    let file = decoded
+                        .escape_ascii()
+                        .map(|c| c as char)
+                        .collect::<String>()
+                        .replace("\\", [134 as char].iter().collect::<String>().as_str());
+
+                    dbg!(&file);
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
