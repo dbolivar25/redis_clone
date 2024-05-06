@@ -77,7 +77,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    RdbFile(Vec<u8>),
+    RdbFile(String),
     Null,
 }
 
@@ -100,7 +100,6 @@ struct Context {
 }
 
 const EMPTY_RDB_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
-const EMPTY_RDB: &str = "REDIS0007\x00\x00\x00\x00\x00\x00\x00\x00";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -442,7 +441,11 @@ impl CommandHandler {
                 if &replid == replid_str && offset == repl_offset.to_string() {
                     vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    let file = hex::decode(EMPTY_RDB_HEX).unwrap().escape_ascii().collect();
+                    let file = hex::decode(EMPTY_RDB_HEX)
+                        .unwrap()
+                        .escape_ascii()
+                        .map(|c| c as char)
+                        .collect();
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
@@ -585,13 +588,7 @@ fn encode_value(val: &Value) -> String {
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
         Value::RdbFile(rdb_file) => {
-            format!(
-                "${}\r\n{}",
-                rdb_file.len(),
-                rdb_file
-                    .iter()
-                    .fold("".to_string(), |acc, e| acc + &format!("{}", e))
-            )
+            format!("${}\r\n{}", rdb_file.len(), rdb_file)
         }
         Value::Null => "_\r\n".to_string(),
     }
@@ -842,7 +839,10 @@ fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
     let (input, values) = take(len as usize)(input)?;
 
-    Ok((input, Value::RdbFile(values.to_vec())))
+    Ok((
+        input,
+        Value::RdbFile(values.iter().map(|&c| c as char).collect()),
+    ))
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
