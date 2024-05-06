@@ -77,7 +77,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    RdbFile(String),
+    RdbFile(usize, String),
     Null,
 }
 
@@ -305,7 +305,7 @@ impl CommandHandler {
                                 }
                             };
 
-                            if let Value::RdbFile(_) = _response {
+                            if let Value::RdbFile(..) = _response {
                                 println!("Completed handshake with master");
                             }
                         }
@@ -441,15 +441,14 @@ impl CommandHandler {
                 if &replid == replid_str && offset == repl_offset.to_string() {
                     vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    let file = hex::decode(EMPTY_RDB_HEX)
-                        .unwrap()
-                        .escape_ascii()
-                        .map(|c| c as char)
-                        .collect();
+                    let decoded = hex::decode(EMPTY_RDB_HEX).unwrap();
+
+                    let len = decoded.len();
+                    let file = decoded.escape_ascii().map(|c| c as char).collect();
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
-                        Value::RdbFile(file),
+                        Value::RdbFile(len, file),
                     ]
                 }
             }
@@ -587,8 +586,8 @@ fn encode_value(val: &Value) -> String {
         }
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
-        Value::RdbFile(rdb_file) => {
-            format!("${}\r\n{}", rdb_file.len(), rdb_file)
+        Value::RdbFile(len, rdb_file) => {
+            format!("${}\r\n{}", len, rdb_file)
         }
         Value::Null => "_\r\n".to_string(),
     }
@@ -841,7 +840,7 @@ fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
     Ok((
         input,
-        Value::RdbFile(values.iter().map(|&c| c as char).collect()),
+        Value::RdbFile(len as usize, values.iter().map(|&c| c as char).collect()),
     ))
 }
 
