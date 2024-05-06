@@ -77,7 +77,7 @@ enum Value {
     NullBulkString,
     #[allow(dead_code)]
     NullArray,
-    RdbFile(String),
+    RdbFile(Vec<u8>),
     Null,
 }
 
@@ -442,11 +442,7 @@ impl CommandHandler {
                 if &replid == replid_str && offset == repl_offset.to_string() {
                     vec![Value::SimpleString("CONTINUE".to_string())]
                 } else {
-                    let file = hex::decode(EMPTY_RDB_HEX)
-                        .unwrap()
-                        .escape_ascii()
-                        .map(|c| c as char)
-                        .collect();
+                    let file = hex::decode(EMPTY_RDB_HEX).unwrap().escape_ascii().collect();
 
                     vec![
                         Value::SimpleString(format!("FULLRESYNC {} {}", replid_str, repl_offset)),
@@ -589,7 +585,13 @@ fn encode_value(val: &Value) -> String {
         Value::NullBulkString => "$-1\r\n".to_string(),
         Value::NullArray => "*-1\r\n".to_string(),
         Value::RdbFile(rdb_file) => {
-            format!("${}\r\n{}", rdb_file.len(), rdb_file)
+            format!(
+                "${}\r\n{}",
+                rdb_file.len(),
+                rdb_file
+                    .iter()
+                    .fold("".to_string(), |acc, e| acc + &format!("{}", e))
+            )
         }
         Value::Null => "_\r\n".to_string(),
     }
@@ -840,10 +842,7 @@ fn parse_rdb_file_impl(input: &[u8]) -> IResult<&[u8], Value> {
 
     let (input, values) = take(len as usize)(input)?;
 
-    Ok((
-        input,
-        Value::RdbFile(values.iter().map(|&c| c as char).collect()),
-    ))
+    Ok((input, Value::RdbFile(values.to_vec())))
 }
 
 fn parse_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
