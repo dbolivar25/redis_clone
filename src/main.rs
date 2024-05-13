@@ -5,15 +5,17 @@ mod types;
 
 use anyhow::Result;
 use clap::Parser;
+use nom::combinator::all_consuming;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::mpsc::Sender,
 };
 
 use command::CommandHandler;
 use config::Args;
 use parsing::parse_command;
-use types::{into_bytes, Context, ServerType, Value};
+use types::{into_bytes, Message, ServerType, Value};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,10 +26,14 @@ async fn main() -> Result<()> {
     println!("Listening on {}", listener.local_addr()?);
 
     let server_type = match replicaof.as_slice() {
-        [] => ServerType::Master(0, "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), 0),
+        [] => ServerType::Master(
+            vec![],
+            "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
+            0,
+        ),
         [host, port] => {
             let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
-            ServerType::Slave(stream)
+            ServerType::Replica(stream)
         }
         _ => unreachable!(),
     };
@@ -40,20 +46,17 @@ async fn main() -> Result<()> {
         let (stream, addr) = listener.accept().await?;
         println!("\nAccepted connection from {}", addr);
 
-        let context = Context::new(stream, msg_sender.clone());
-        tokio::spawn(handle_connection(context));
+        tokio::spawn(handle_connection(stream, msg_sender.clone()));
     }
 }
 
-async fn handle_connection(context: Context) {
-    let mut buffer = [0; 1024];
-    let Context {
-        mut stream,
-        msg_sender,
-    } = context;
+async fn handle_connection(stream: TcpStream, msg_sender: Sender<Message>) {
+    let mut buffer = Vec::new();
+    let mut stream = BufReader::new(stream);
 
     loop {
-        let n = match stream.read(&mut buffer).await {
+        let mut chunk = [0; 1024];
+        let n = match stream.read(&mut chunk).await {
             Ok(0) => {
                 println!("Connection closed");
                 return;
@@ -65,15 +68,53 @@ async fn handle_connection(context: Context) {
             }
         };
 
-        let received_data = &buffer[..n];
-        println!("Received: {:?}", String::from_utf8_lossy(received_data));
+        buffer.extend_from_slice(&chunk[..n]);
 
-        let command = match parse_command(received_data) {
-            Ok(command) => command,
-            Err(e) => {
-                eprintln!("Failed to parse command: {}", e);
+        println!("Buffer: {}", buffer.escape_ascii());
 
-                let response = Value::SimpleError(e.to_string());
+        loop {
+            let (remaining, command) = match all_consuming(parse_command)(&buffer) {
+                Ok((remaining, command)) => (remaining, command),
+                Err(nom::Err::Incomplete(_)) => break,
+                Err(e) => {
+                    eprintln!("Failed to parse command: {}", e);
+
+                    let response = Value::SimpleError(e.to_string());
+                    let encoded_response = into_bytes(&response);
+
+                    if let Err(e) = stream.write_all(&encoded_response).await {
+                        eprintln!("Failed to write to socket: {}", e);
+                        return;
+                    }
+
+                    println!("Sent: {}", encoded_response.escape_ascii());
+
+                    continue;
+                }
+            };
+
+            buffer = remaining.to_vec();
+
+            let responses = match msg_sender.send_command(command).await {
+                Ok(response) => response,
+                Err(e) => {
+                    eprintln!("Failed to send command: {}", e);
+
+                    let response = Value::SimpleError(e.to_string());
+                    let encoded_response = into_bytes(&response);
+
+                    if let Err(e) = stream.write_all(&encoded_response).await {
+                        eprintln!("Failed to write to socket: {}", e);
+                        return;
+                    }
+
+                    println!("Sent: {}", encoded_response.escape_ascii());
+
+                    continue;
+                }
+            };
+
+            for response in responses {
                 let encoded_response = into_bytes(&response);
 
                 if let Err(e) = stream.write_all(&encoded_response).await {
@@ -81,40 +122,8 @@ async fn handle_connection(context: Context) {
                     return;
                 }
 
-                println!("Sent: {:?}", encoded_response);
-
-                continue;
+                println!("Sent: {}", encoded_response.escape_ascii());
             }
-        };
-
-        let responses = match msg_sender.send_command(command).await {
-            Ok(response) => response,
-            Err(e) => {
-                eprintln!("Failed to send command: {}", e);
-
-                let response = Value::SimpleError(e.to_string());
-                let encoded_response = into_bytes(&response);
-
-                if let Err(e) = stream.write_all(&encoded_response).await {
-                    eprintln!("Failed to write to socket: {}", e);
-                    return;
-                }
-
-                println!("Sent: {:?}", encoded_response);
-
-                continue;
-            }
-        };
-
-        for response in responses {
-            let encoded_response = into_bytes(&response);
-
-            if let Err(e) = stream.write_all(&encoded_response).await {
-                eprintln!("Failed to write to socket: {}", e);
-                return;
-            }
-
-            println!("Sent: {:?}", encoded_response);
         }
     }
 }

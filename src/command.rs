@@ -1,4 +1,6 @@
+use anyhow::{anyhow, Result};
 use chrono::Utc;
+use itertools::Itertools;
 use std::{
     collections::{BTreeMap, HashMap},
     time::Duration,
@@ -44,167 +46,10 @@ impl CommandHandler {
     pub(crate) async fn run(mut self) {
         let mut gc_interval = interval(Duration::from_secs(1));
 
-        if let ServerType::Slave(ref mut stream) = self.server_type {
-            let mut buf = [0; 1024];
-
-            let encoded_response =
-                into_bytes(&Value::Array(vec![Value::BulkString("PING".to_string())]));
-
-            if let Err(e) = stream.write_all(&encoded_response).await {
-                eprintln!("Failed to write to socket: {}", e);
-                return;
-            }
-
-            let n = match stream.read(&mut buf).await {
-                Ok(0) => {
-                    println!("Connection closed");
-                    return;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to read from socket: {}", e);
-                    return;
-                }
-            };
-
-            let received_data = &buf[..n];
-            println!("Received: {:?}", String::from_utf8_lossy(received_data));
-
-            let encoded_response = into_bytes(&Value::Array(vec![
-                Value::BulkString("REPLCONF".to_string()),
-                Value::BulkString("listening-port".to_string()),
-                Value::BulkString(format!("{}", self.listen_port)),
-            ]));
-
-            if let Err(e) = stream.write_all(&encoded_response).await {
-                eprintln!("Failed to write to socket: {}", e);
-                return;
-            }
-
-            let n = match stream.read(&mut buf).await {
-                Ok(0) => {
-                    println!("Connection closed");
-                    return;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to read from socket: {}", e);
-                    return;
-                }
-            };
-
-            let received_data = &buf[..n];
-            println!("Received: {:?}", String::from_utf8_lossy(received_data));
-
-            let encoded_response = into_bytes(&Value::Array(vec![
-                Value::BulkString("REPLCONF".to_string()),
-                Value::BulkString("capa".to_string()),
-                Value::BulkString("eof".to_string()),
-                Value::BulkString("capa".to_string()),
-                Value::BulkString("psync2".to_string()),
-            ]));
-
-            if let Err(e) = stream.write_all(&encoded_response).await {
-                eprintln!("Failed to write to socket: {}", e);
-                return;
-            }
-
-            let n = match stream.read(&mut buf).await {
-                Ok(0) => {
-                    println!("Connection closed");
-                    return;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to read from socket: {}", e);
-                    return;
-                }
-            };
-
-            let received_data = &buf[..n];
-            println!("Received: {:?}", String::from_utf8_lossy(received_data));
-
-            let encoded_response = into_bytes(&Value::Array(vec![
-                Value::BulkString("PSYNC".to_string()),
-                Value::BulkString("?".to_string()),
-                Value::BulkString("-1".to_string()),
-            ]));
-
-            if let Err(e) = stream.write_all(&encoded_response).await {
-                eprintln!("Failed to write to socket: {}", e);
-                return;
-            }
-
-            let n = match stream.read(&mut buf).await {
-                Ok(0) => {
-                    println!("Connection closed");
-                    return;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to read from socket: {}", e);
-                    return;
-                }
-            };
-
-            let received_data = &buf[..n];
-            println!("Received: {:?}", String::from_utf8_lossy(received_data));
-
-            let (remaining, response) = match parse_simple_string(received_data) {
-                Ok(res) => res,
-                Err(e) => {
-                    eprintln!("Failed to parse response: {}", e);
-                    return;
-                }
-            };
-
-            match response {
-                Value::SimpleString(s) => {
-                    let parts = s.split_whitespace().collect::<Vec<_>>();
-                    match parts.as_slice() {
-                        [msg] if msg.to_lowercase().as_str() == "continue" => {}
-                        [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
-                            let received = if remaining.is_empty() {
-                                let n = match stream.read(&mut buf).await {
-                                    Ok(0) => {
-                                        println!("Connection closed");
-                                        return;
-                                    }
-                                    Ok(n) => n,
-                                    Err(e) => {
-                                        eprintln!("Failed to read from socket: {}", e);
-                                        return;
-                                    }
-                                };
-
-                                &buf[..n]
-                            } else {
-                                remaining
-                            };
-
-                            let (_remaining, _response) = match parse_rdb_file(received) {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    eprintln!("Failed to parse response: {}", e);
-                                    return;
-                                }
-                            };
-
-                            if let Value::RdbFile(..) = _response {
-                                println!("Completed handshake with master");
-                            }
-                        }
-                        _ => {
-                            eprintln!("Invalid response: {}", s);
-                            return;
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!("Invalid response type");
-                    return;
-                }
-            }
+        let result = self.handle_handshake().await;
+        if let Err(e) = result {
+            eprintln!("Failed to handle handshake: {}", e);
+            return;
         }
 
         loop {
@@ -286,14 +131,14 @@ impl CommandHandler {
                     "replication" => {
                         let role = match &self.server_type {
                             ServerType::Master(_, _, _) => "master",
-                            ServerType::Slave(_) => "slave",
+                            ServerType::Replica(_) => "slave",
                         };
 
                         let (replid, repl_offset) = match &self.server_type {
                             ServerType::Master(_, replid, repl_offset) => {
                                 (replid.as_str(), repl_offset)
                             }
-                            ServerType::Slave(_) => ("0", &0),
+                            ServerType::Replica(_) => ("0", &0),
                         };
 
                         vec![
@@ -336,7 +181,164 @@ impl CommandHandler {
                     ]
                 }
             }
-            ServerType::Slave(_) => vec![Value::SimpleString("CONTINUE".to_string())],
+            ServerType::Replica(_) => vec![Value::SimpleString("CONTINUE".to_string())],
+        }
+    }
+
+    async fn handle_handshake(&mut self) -> Result<()> {
+        if let ServerType::Replica(ref mut stream) = self.server_type {
+            let mut buf = [0; 1024];
+
+            let encoded_response =
+                into_bytes(&Value::Array(vec![Value::BulkString("PING".to_string())]));
+
+            if let Err(e) = stream.write_all(&encoded_response).await {
+                return Err(anyhow!("Failed to write to socket: {}", e));
+            }
+
+            println!("Sent: {}", encoded_response.escape_ascii());
+
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    return Err(anyhow!("Connection closed"));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(anyhow!("Failed to read from socket: {}", e));
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {}", received_data.escape_ascii());
+
+            let encoded_response = into_bytes(&Value::Array(vec![
+                Value::BulkString("REPLCONF".to_string()),
+                Value::BulkString("listening-port".to_string()),
+                Value::BulkString(format!("{}", self.listen_port)),
+            ]));
+
+            if let Err(e) = stream.write_all(&encoded_response).await {
+                return Err(anyhow!("Failed to write to socket: {}", e));
+            }
+
+            println!("Sent: {}", encoded_response.escape_ascii());
+
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    return Err(anyhow!("Connection closed"));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(anyhow!("Failed to read from socket: {}", e));
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {}", received_data.escape_ascii());
+
+            let encoded_response = into_bytes(&Value::Array(vec![
+                Value::BulkString("REPLCONF".to_string()),
+                Value::BulkString("capa".to_string()),
+                Value::BulkString("eof".to_string()),
+                Value::BulkString("capa".to_string()),
+                Value::BulkString("psync2".to_string()),
+            ]));
+
+            if let Err(e) = stream.write_all(&encoded_response).await {
+                return Err(anyhow!("Failed to write to socket: {}", e));
+            }
+
+            println!("Sent: {}", encoded_response.escape_ascii());
+
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    return Err(anyhow!("Connection closed"));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(anyhow!("Failed to read from socket: {}", e));
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {}", received_data.escape_ascii());
+
+            let encoded_response = into_bytes(&Value::Array(vec![
+                Value::BulkString("PSYNC".to_string()),
+                Value::BulkString("?".to_string()),
+                Value::BulkString("-1".to_string()),
+            ]));
+
+            if let Err(e) = stream.write_all(&encoded_response).await {
+                return Err(anyhow!("Failed to write to socket: {}", e));
+            }
+
+            println!("Sent: {}", encoded_response.escape_ascii());
+
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => {
+                    return Err(anyhow!("Connection closed"));
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(anyhow!("Failed to read from socket: {}", e));
+                }
+            };
+
+            let received_data = &buf[..n];
+            println!("Received: {}", received_data.escape_ascii());
+
+            let (remaining, response) = match parse_simple_string(received_data) {
+                Ok(res) => res,
+                Err(e) => {
+                    return Err(anyhow!("Failed to parse response: {}", e));
+                }
+            };
+
+            if let Value::SimpleString(s) = response {
+                let parts = s.split_whitespace().collect_vec();
+                match parts.as_slice() {
+                    [msg] if msg.to_lowercase().as_str() == "continue" => Ok(()),
+                    [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
+                        let received = if remaining.is_empty() {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) => {
+                                    return Err(anyhow!("Connection closed"));
+                                }
+                                Ok(n) => n,
+                                Err(e) => {
+                                    return Err(anyhow!("Failed to read from socket: {}", e));
+                                }
+                            };
+
+                            &buf[..n]
+                        } else {
+                            remaining
+                        };
+
+                        let (_remaining, response) = match parse_rdb_file(received) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                return Err(anyhow!("Failed to parse response: {}", e));
+                            }
+                        };
+
+                        if let Value::RdbFile(response) = response {
+                            println!("Received: {}", response.escape_ascii());
+                            Ok(())
+                        } else {
+                            Err(anyhow!("Invalid response: {}", s))
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow!("Invalid response: {}", s));
+                    }
+                }
+            } else {
+                return Err(anyhow!("Invalid response: {:?}", response));
+            }
+        } else {
+            Ok(())
         }
     }
 

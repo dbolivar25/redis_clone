@@ -1,5 +1,4 @@
-use anyhow::{anyhow, Result};
-use itertools::{Either, Itertools};
+use itertools::Itertools;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take, take_until},
@@ -12,144 +11,92 @@ use nom::{
 
 use crate::types::{Command, Value};
 
-pub(crate) fn parse_command(input: &[u8]) -> Result<Command> {
-    let (_, array) = parse_array(input).map_err(|_| anyhow!("Failed to parse array"))?;
-    let mut args = match array {
-        Value::Array(args) => args.into_iter(),
-        _ => return Err(anyhow!("Invalid command format: expected an Array")),
+pub(crate) fn parse_command(input: &[u8]) -> IResult<&[u8], Command> {
+    let (remaining, val) = parse_array(input)?;
+
+    let (command, args) = match val {
+        Value::Array(array) => match array.as_slice() {
+            [Value::BulkString(command), args @ ..] => {
+                (command.to_lowercase().to_owned(), args.to_owned())
+            }
+            _ => {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::IsNot,
+                )))
+            }
+        },
+        _ => unreachable!(),
     };
 
-    let command_value = args.next().ok_or_else(|| anyhow!("Empty command"))?;
-    let command = match command_value {
-        Value::BulkString(command) => command,
-        _ => return Err(anyhow!("Invalid command type: expected a BulkString")),
-    };
+    match (command.as_str(), args.as_slice()) {
+        ("ping", []) => Ok((remaining, Command::Ping)),
+        ("echo", [contents]) => Ok((remaining, Command::Echo(contents.to_owned()))),
+        ("get", [key]) => Ok((remaining, Command::Get(key.to_owned()))),
+        ("set", [key, value]) => Ok((
+            remaining,
+            Command::Set(key.to_owned(), value.to_owned(), None),
+        )),
+        ("set", [key, value, Value::BulkString(expr_flag), Value::BulkString(expr_val)])
+            if expr_flag.eq_ignore_ascii_case("ex") =>
+        {
+            let parsed_expr_val = expr_val.parse::<u128>().map_err(|_| {
+                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::IsNot))
+            })?;
 
-    match command.to_lowercase().as_str() {
-        "ping" => {
-            if args.next().is_some() {
-                Err(anyhow!("PING command does not take any arguments"))
-            } else {
-                Ok(Command::Ping)
-            }
+            Ok((
+                remaining,
+                Command::Set(
+                    key.to_owned(),
+                    value.to_owned(),
+                    Some(parsed_expr_val * 1000),
+                ),
+            ))
         }
-        "echo" => {
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing value for ECHO command"))?;
-            if args.next().is_some() {
-                Err(anyhow!("ECHO command takes exactly one argument"))
-            } else {
-                Ok(Command::Echo(value))
-            }
+        ("set", [key, value, Value::BulkString(expr_flag), Value::BulkString(expr_val)])
+            if expr_flag.eq_ignore_ascii_case("px") =>
+        {
+            let parsed_expr_val = expr_val.parse::<u128>().map_err(|_| {
+                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::IsNot))
+            })?;
+
+            Ok((
+                remaining,
+                Command::Set(key.to_owned(), value.to_owned(), Some(parsed_expr_val)),
+            ))
         }
-        "get" => {
-            let key = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing key for GET command"))?;
-            if args.next().is_some() {
-                Err(anyhow!("GET command takes exactly one argument"))
-            } else {
-                Ok(Command::Get(key))
-            }
-        }
-        "set" => {
-            let key = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing key for SET command"))?;
-
-            let value = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing value for SET command"))?;
-
-            match args.next() {
-                Some(Value::BulkString(s)) => match s.to_lowercase().as_str() {
-                    "ex" => {
-                        let expiration = match args.next() {
-                            Some(Value::BulkString(expiration)) => {
-                                Some(expiration.parse::<u128>()? * 1000)
-                            }
-                            Some(_) => {
-                                return Err(anyhow!(
-                                    "Invalid expiration type: expected a BulkString"
-                                ))
-                            }
-                            None => None,
-                        };
-
-                        if args.next().is_some() {
-                            Err(anyhow!("SET command takes two or three arguments"))
-                        } else {
-                            Ok(Command::Set(key, value, expiration))
-                        }
-                    }
-                    "px" => {
-                        let expiration = match args.next() {
-                            Some(Value::BulkString(expiration)) => {
-                                Some(expiration.parse::<u128>()?)
-                            }
-                            Some(_) => {
-                                return Err(anyhow!(
-                                    "Invalid expiration type: expected a BulkString"
-                                ))
-                            }
-                            None => None,
-                        };
-
-                        if args.next().is_some() {
-                            Err(anyhow!("SET command takes two or three arguments"))
-                        } else {
-                            Ok(Command::Set(key, value, expiration))
-                        }
-                    }
-                    _ => return Err(anyhow!("Invalid SET option")),
-                },
-                Some(_) => return Err(anyhow!("Invalid SET option")),
-                None => Ok(Command::Set(key, value, None)),
-            }
-        }
-        "info" => {
-            if let Some(of_type) = args.next() {
-                if args.next().is_some() {
-                    Err(anyhow!("INFO command takes zero or one argument"))
-                } else {
-                    Ok(Command::Info(of_type))
-                }
-            } else {
-                Ok(Command::Info(Value::BulkString("default".to_string())))
-            }
-        }
-        "replconf" => {
-            let (oks, errs): (Vec<_>, Vec<_>) = args.tuples().partition_map(|pair| {
-                if let (Value::BulkString(_), Value::BulkString(_)) = pair {
-                    Either::Left(pair)
-                } else {
-                    Either::Right(())
-                }
-            });
-
-            if !errs.is_empty() {
-                return Err(anyhow!("Invalid REPLCONF option"));
+        ("info", [of_type]) => Ok((remaining, Command::Info(of_type.to_owned()))),
+        ("replconf", pairs) => {
+            if pairs.len() % 2 != 0 {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::IsNot,
+                )));
             }
 
-            Ok(Command::ReplConf(oks))
-        }
-        "psync" => {
-            let replid = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing REPLID for PSYNC command"))?;
-
-            let offset = args
-                .next()
-                .ok_or_else(|| anyhow!("Missing OFFSET for PSYNC command"))?;
-
-            if args.next().is_some() {
-                Err(anyhow!("PSYNC command takes exactly two arguments"))
-            } else {
-                Ok(Command::Psync(replid, offset))
+            if pairs.iter().any(|val| !matches!(val, Value::BulkString(_))) {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::IsNot,
+                )));
             }
+
+            let pairs = pairs
+                .into_iter()
+                .tuples()
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .collect_vec();
+
+            Ok((remaining, Command::ReplConf(pairs)))
         }
-        _ => Err(anyhow!("Unknown command: {}", command)),
+        ("psync", [replid, offset]) => Ok((
+            remaining,
+            Command::Psync(replid.to_owned(), offset.to_owned()),
+        )),
+        _ => Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::IsNot,
+        ))),
     }
 }
 

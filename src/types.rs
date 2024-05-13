@@ -21,15 +21,11 @@ pub(crate) enum Command {
 pub(crate) struct MsgSender {
     msg_sender: Sender<Message>,
 }
-pub(crate) struct Context {
-    pub(crate) stream: TcpStream,
-    pub(crate) msg_sender: MsgSender,
-}
 
 #[derive(Debug)]
 pub(crate) enum ServerType {
-    Master(u32, String, u128),
-    Slave(TcpStream),
+    Master(Vec<TcpStream>, String, u128),
+    Replica(TcpStream),
 }
 
 #[derive(Debug)]
@@ -55,15 +51,15 @@ pub(crate) enum Value {
 impl Display for ServerType {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            ServerType::Master(_count, _replid, _repl_offset) => write!(f, "master"),
-            ServerType::Slave(_master_strm) => write!(f, "slave"),
+            ServerType::Master(..) => write!(f, "master"),
+            ServerType::Replica(..) => write!(f, "slave"),
         }
     }
 }
 
 impl MsgSender {
     pub(crate) async fn send_command(&self, command: Command) -> Result<Vec<Value>> {
-        let (response_sender, mut response_receiver) = mpsc::channel(2);
+        let (response_sender, mut response_receiver) = mpsc::channel(16);
 
         let message = Message {
             command,
@@ -81,13 +77,6 @@ impl MsgSender {
     }
 }
 
-impl Context {
-    pub(crate) fn new(stream: TcpStream, msg_sender: Sender<Message>) -> Self {
-        let msg_sender = MsgSender { msg_sender };
-        Context { stream, msg_sender }
-    }
-}
-
 pub(crate) fn into_bytes(val: &Value) -> Vec<u8> {
     match val {
         Value::SimpleString(s) => format!("+{}\r\n", s).into_bytes(),
@@ -95,10 +84,9 @@ pub(crate) fn into_bytes(val: &Value) -> Vec<u8> {
         Value::Integer(i) => format!(":{}\r\n", i).into_bytes(),
         Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s).into_bytes(),
         Value::Array(vals) => {
-            let n = vals.len();
             let body = vals.iter().map(into_bytes).flatten().collect_vec();
 
-            format!("*{}\r\n", n)
+            format!("*{}\r\n", vals.len())
                 .into_bytes()
                 .iter()
                 .chain(body.iter())
