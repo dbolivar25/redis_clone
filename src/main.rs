@@ -5,17 +5,15 @@ mod types;
 
 use anyhow::Result;
 use clap::Parser;
-use nom::combinator::all_consuming;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::mpsc::Sender,
 };
 
 use command::CommandHandler;
 use config::Args;
 use parsing::parse_command;
-use types::{into_bytes, Message, ServerType, Value};
+use types::{into_bytes, MsgSender, ServerType, Value};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,13 +42,15 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        let msg_sender = MsgSender::new(msg_sender.clone());
+
         println!("\nAccepted connection from {}", addr);
 
-        tokio::spawn(handle_connection(stream, msg_sender.clone()));
+        tokio::spawn(handle_connection(stream, msg_sender));
     }
 }
 
-async fn handle_connection(stream: TcpStream, msg_sender: Sender<Message>) {
+async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
     let mut buffer = Vec::new();
     let mut stream = BufReader::new(stream);
 
@@ -72,10 +72,9 @@ async fn handle_connection(stream: TcpStream, msg_sender: Sender<Message>) {
 
         println!("Buffer: {}", buffer.escape_ascii());
 
-        loop {
-            let (remaining, command) = match all_consuming(parse_command)(&buffer) {
+        while buffer.len() > 0 {
+            let (remaining, command) = match parse_command(&buffer) {
                 Ok((remaining, command)) => (remaining, command),
-                Err(nom::Err::Incomplete(_)) => break,
                 Err(e) => {
                     eprintln!("Failed to parse command: {}", e);
 
@@ -89,7 +88,7 @@ async fn handle_connection(stream: TcpStream, msg_sender: Sender<Message>) {
 
                     println!("Sent: {}", encoded_response.escape_ascii());
 
-                    continue;
+                    return;
                 }
             };
 

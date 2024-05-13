@@ -58,6 +58,10 @@ impl Display for ServerType {
 }
 
 impl MsgSender {
+    pub(crate) fn new(msg_sender: Sender<Message>) -> Self {
+        Self { msg_sender }
+    }
+
     pub(crate) async fn send_command(&self, command: Command) -> Result<Vec<Value>> {
         let (response_sender, mut response_receiver) = mpsc::channel(16);
 
