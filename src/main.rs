@@ -6,7 +6,7 @@ mod types;
 use anyhow::Result;
 use clap::Parser;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
@@ -25,17 +25,17 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(bind_addr.clone()).await?;
     println!("Listening on {}", listener.local_addr()?);
 
-    let server_type = match replicaof.as_slice() {
-        [] => ServerType::Master(
+    let server_type = match replicaof {
+        None => ServerType::Master(
             vec![],
             "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
             0,
         ),
-        [host, port] => {
+        Some(master) => {
+            let (host, port) = master.split_once(' ').unwrap();
             let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
             ServerType::Replica(stream)
         }
-        _ => unreachable!(),
     };
 
     let (command_handler, msg_sender) = CommandHandler::new(port, server_type);

@@ -9,6 +9,6 @@ pub(crate) struct Args {
     pub(crate) port: u16,
 
     /// Host and port of the master server
-    #[clap(short, long, num_args = 2)]
-    pub(crate) replicaof: Vec<String>,
+    #[clap(short, long, default_value = None)]
+    pub(crate) replicaof: Option<String>,
 }
