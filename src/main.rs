@@ -13,7 +13,9 @@ use tokio::{
 use command::CommandHandler;
 use config::Args;
 use parsing::parse_command;
-use types::{into_bytes, MsgSender, ServerType, Value};
+use types::{val_into_bytes, MsgSender, ServerType, Value};
+
+use crate::types::Command;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,9 +52,9 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
+async fn handle_connection(mut stream: TcpStream, msg_sender: MsgSender) {
     let mut buffer = Vec::new();
-    let mut stream = BufReader::new(stream);
+    // let mut stream = BufReader::new(stream);
 
     loop {
         let mut chunk = [0; 1024];
@@ -79,7 +81,7 @@ async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
                     eprintln!("Failed to parse command: {}", e);
 
                     let response = Value::SimpleError(e.to_string());
-                    let encoded_response = into_bytes(&response);
+                    let encoded_response = val_into_bytes(&response);
 
                     if let Err(e) = stream.write_all(&encoded_response).await {
                         eprintln!("Failed to write to socket: {}", e);
@@ -88,11 +90,14 @@ async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
 
                     println!("Sent: {}", encoded_response.escape_ascii());
 
-                    return;
+                    buffer.clear();
+                    break;
                 }
             };
 
             buffer = remaining.to_vec();
+
+            let repl_add = matches!(command, Command::Psync(..));
 
             let responses = match msg_sender.send_command(command).await {
                 Ok(response) => response,
@@ -100,7 +105,7 @@ async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
                     eprintln!("Failed to send command: {}", e);
 
                     let response = Value::SimpleError(e.to_string());
-                    let encoded_response = into_bytes(&response);
+                    let encoded_response = val_into_bytes(&response);
 
                     if let Err(e) = stream.write_all(&encoded_response).await {
                         eprintln!("Failed to write to socket: {}", e);
@@ -114,7 +119,7 @@ async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
             };
 
             for response in responses {
-                let encoded_response = into_bytes(&response);
+                let encoded_response = val_into_bytes(&response);
 
                 if let Err(e) = stream.write_all(&encoded_response).await {
                     eprintln!("Failed to write to socket: {}", e);
@@ -122,6 +127,16 @@ async fn handle_connection(stream: TcpStream, msg_sender: MsgSender) {
                 }
 
                 println!("Sent: {}", encoded_response.escape_ascii());
+            }
+
+            if repl_add {
+                match msg_sender.send_command(Command::ReplAdd(stream)).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        eprintln!("Failed to send command: ReplAdd");
+                    }
+                }
+                return;
             }
         }
     }

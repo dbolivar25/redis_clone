@@ -12,9 +12,12 @@ use tokio::{
     time::interval,
 };
 
-use crate::parsing::{parse_rdb_file, parse_simple_string};
-use crate::types::into_bytes;
+use crate::types::{cmd_into_bytes, val_into_bytes};
 use crate::types::{Command, Message, ServerType, Value};
+use crate::{
+    parsing::{parse_rdb_file, parse_simple_string},
+    types::Expiration,
+};
 
 const EMPTY_RDB_HEX: &str = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
 
@@ -46,8 +49,7 @@ impl CommandHandler {
     pub(crate) async fn run(mut self) {
         let mut gc_interval = interval(Duration::from_secs(1));
 
-        let result = self.handle_handshake().await;
-        if let Err(e) = result {
+        if let Err(e) = self.handle_handshake().await {
             eprintln!("Failed to handle handshake: {}", e);
             return;
         }
@@ -60,21 +62,53 @@ impl CommandHandler {
                 Some(message) = self.msg_receiver.recv() => {
                     let Message { command, response_sender } = message;
 
+                    match command {
+                        Command::Set(..) => {
+                            match self.server_type {
+                                ServerType::Master(ref mut repl_streams, ..) => {
+                                    let mut to_remove = vec![];
+
+                                    for (i, stream) in repl_streams.iter_mut().enumerate() {
+                                        let encoded_command = cmd_into_bytes(&command);
+
+                                        if let Err(_) = stream.write_all(&encoded_command).await {
+                                            to_remove.push(i);
+                                        }
+                                    }
+
+                                    for i in to_remove.into_iter().rev() {
+                                        repl_streams.remove(i);
+                                    }
+                                }
+                                ServerType::Replica(..) => {},
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let responses = match command {
                         Command::Ping => self.handle_ping(),
                         Command::Echo(value) => self.handle_echo(value),
                         Command::Get(key) => self.handle_get(key),
                         Command::Set(key, value, expiration) => self.handle_set(key, value, expiration),
                         Command::Info(of_type) => self.handle_info(of_type),
-                        Command::ReplConf(_pairs) => vec![Value::SimpleString("OK".to_string())],
+                        Command::ReplConf(pairs) => self.handle_replconf(pairs),
                         Command::Psync(replid, offset) => self.handle_psync(replid, offset),
+                        Command::ReplAdd(stream) => {
+                            match self.server_type {
+                                ServerType::Master(ref mut repl_streams, ..) => {
+                                    repl_streams.push(stream);
+                                }
+                                ServerType::Replica(..) => {}
+                            }
+
+                            vec![]
+                        }
                     };
 
                     if let Some(response_sender) = response_sender {
-                        for response in responses {
-                            if let Err(e) = response_sender.send(response).await {
-                                eprintln!("Failed to send response: {}", e);
-                            }
+                        if let Err(e) = response_sender.send(responses) {
+                            eprintln!("Failed to send response: {:?}", e);
                         }
                     }
                 }
@@ -109,10 +143,18 @@ impl CommandHandler {
         vec![value.clone()]
     }
 
-    fn handle_set(&mut self, key: Value, value: Value, expiration: Option<u128>) -> Vec<Value> {
+    fn handle_set(
+        &mut self,
+        key: Value,
+        value: Value,
+        expiration: Option<Expiration>,
+    ) -> Vec<Value> {
         let expiration_time = expiration.map(|val| {
             let now = Utc::now().timestamp_millis() as u128;
-            now + val
+            match val {
+                Expiration::Ex(s) => now + s * 1000,
+                Expiration::Px(ms) => now + ms,
+            }
         });
 
         self.data.insert(key.clone(), (expiration_time, value));
@@ -130,15 +172,15 @@ impl CommandHandler {
                 let info = match s.to_lowercase().as_str() {
                     "replication" => {
                         let role = match &self.server_type {
-                            ServerType::Master(_, _, _) => "master",
-                            ServerType::Replica(_) => "slave",
+                            ServerType::Master(..) => "master",
+                            ServerType::Replica(..) => "slave",
                         };
 
                         let (replid, repl_offset) = match &self.server_type {
                             ServerType::Master(_, replid, repl_offset) => {
                                 (replid.as_str(), repl_offset)
                             }
-                            ServerType::Replica(_) => ("0", &0),
+                            ServerType::Replica(..) => ("0", &0),
                         };
 
                         vec![
@@ -155,6 +197,22 @@ impl CommandHandler {
             }
             _ => vec![Value::SimpleError("Invalid INFO type".to_string())],
         }
+    }
+
+    fn handle_replconf(&self, pairs: Vec<(Value, Value)>) -> Vec<Value> {
+        for (key, value) in pairs {
+            match (key, value) {
+                (Value::BulkString(k), Value::BulkString(v))
+                    if k.eq_ignore_ascii_case("listening-port")
+                        && v.parse() == Ok(self.listen_port) => {}
+                (Value::BulkString(_k), Value::BulkString(_v)) => {}
+                _ => {
+                    return vec![Value::SimpleError("Invalid REPLCONF value".to_string())];
+                }
+            }
+        }
+
+        vec![Value::SimpleString("OK".to_string())]
     }
 
     fn handle_psync(&self, replid: Value, offset: Value) -> Vec<Value> {
@@ -190,7 +248,7 @@ impl CommandHandler {
             let mut buf = [0; 1024];
 
             let encoded_response =
-                into_bytes(&Value::Array(vec![Value::BulkString("PING".to_string())]));
+                val_into_bytes(&Value::Array(vec![Value::BulkString("PING".to_string())]));
 
             if let Err(e) = stream.write_all(&encoded_response).await {
                 return Err(anyhow!("Failed to write to socket: {}", e));
@@ -211,7 +269,17 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {}", received_data.escape_ascii());
 
-            let encoded_response = into_bytes(&Value::Array(vec![
+            match parse_simple_string(received_data) {
+                Ok((_, Value::SimpleString(s))) if s.eq_ignore_ascii_case("pong") => {}
+                Ok(_) => {
+                    return Err(anyhow!("Invalid response: {:?}", received_data));
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to parse response: {}", e));
+                }
+            }
+
+            let encoded_response = val_into_bytes(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
                 Value::BulkString("listening-port".to_string()),
                 Value::BulkString(format!("{}", self.listen_port)),
@@ -236,7 +304,17 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {}", received_data.escape_ascii());
 
-            let encoded_response = into_bytes(&Value::Array(vec![
+            match parse_simple_string(received_data) {
+                Ok((_, Value::SimpleString(s))) if s.eq_ignore_ascii_case("ok") => {}
+                Ok(_) => {
+                    return Err(anyhow!("Invalid response: {:?}", received_data));
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to parse response: {}", e));
+                }
+            }
+
+            let encoded_response = val_into_bytes(&Value::Array(vec![
                 Value::BulkString("REPLCONF".to_string()),
                 Value::BulkString("capa".to_string()),
                 Value::BulkString("eof".to_string()),
@@ -263,7 +341,17 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {}", received_data.escape_ascii());
 
-            let encoded_response = into_bytes(&Value::Array(vec![
+            match parse_simple_string(received_data) {
+                Ok((_, Value::SimpleString(s))) if s.eq_ignore_ascii_case("ok") => {}
+                Ok(_) => {
+                    return Err(anyhow!("Invalid response: {:?}", received_data));
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to parse response: {}", e));
+                }
+            }
+
+            let encoded_response = val_into_bytes(&Value::Array(vec![
                 Value::BulkString("PSYNC".to_string()),
                 Value::BulkString("?".to_string()),
                 Value::BulkString("-1".to_string()),
@@ -288,54 +376,49 @@ impl CommandHandler {
             let received_data = &buf[..n];
             println!("Received: {}", received_data.escape_ascii());
 
-            let (remaining, response) = match parse_simple_string(received_data) {
-                Ok(res) => res,
+            match parse_simple_string(received_data) {
+                Ok((_, Value::SimpleString(s))) if s.eq_ignore_ascii_case("continue") => Ok(()),
+                Ok((remaining, Value::SimpleString(s))) => {
+                    let parts = s.split_whitespace().collect_vec();
+
+                    match parts.as_slice() {
+                        [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
+                            let rdb_file = if remaining.is_empty() {
+                                let n = match stream.read(&mut buf).await {
+                                    Ok(0) => {
+                                        return Err(anyhow!("Connection closed"));
+                                    }
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        return Err(anyhow!("Failed to read from socket: {}", e));
+                                    }
+                                };
+
+                                &buf[..n]
+                            } else {
+                                remaining
+                            };
+
+                            match parse_rdb_file(rdb_file) {
+                                Ok((_, Value::RdbFile(rdb_file))) => {
+                                    println!("Received: {}", rdb_file.escape_ascii());
+                                    Ok(())
+                                }
+                                Ok(_) => Err(anyhow!("Invalid response: {}", s)),
+                                Err(e) => Err(anyhow!("Failed to parse response: {}", e)),
+                            }
+                        }
+                        _ => {
+                            return Err(anyhow!("Invalid response: {}", s));
+                        }
+                    }
+                }
+                Ok(_) => {
+                    return Err(anyhow!("Invalid response: {:?}", received_data));
+                }
                 Err(e) => {
                     return Err(anyhow!("Failed to parse response: {}", e));
                 }
-            };
-
-            if let Value::SimpleString(s) = response {
-                let parts = s.split_whitespace().collect_vec();
-                match parts.as_slice() {
-                    [msg] if msg.to_lowercase().as_str() == "continue" => Ok(()),
-                    [msg, _replid, _offset] if msg.to_lowercase().as_str() == "fullresync" => {
-                        let received = if remaining.is_empty() {
-                            let n = match stream.read(&mut buf).await {
-                                Ok(0) => {
-                                    return Err(anyhow!("Connection closed"));
-                                }
-                                Ok(n) => n,
-                                Err(e) => {
-                                    return Err(anyhow!("Failed to read from socket: {}", e));
-                                }
-                            };
-
-                            &buf[..n]
-                        } else {
-                            remaining
-                        };
-
-                        let (_remaining, response) = match parse_rdb_file(received) {
-                            Ok(res) => res,
-                            Err(e) => {
-                                return Err(anyhow!("Failed to parse response: {}", e));
-                            }
-                        };
-
-                        if let Value::RdbFile(response) = response {
-                            println!("Received: {}", response.escape_ascii());
-                            Ok(())
-                        } else {
-                            Err(anyhow!("Invalid response: {}", s))
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow!("Invalid response: {}", s));
-                    }
-                }
-            } else {
-                return Err(anyhow!("Invalid response: {:?}", response));
             }
         } else {
             Ok(())

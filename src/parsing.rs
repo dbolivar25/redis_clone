@@ -9,7 +9,7 @@ use nom::{
     IResult,
 };
 
-use crate::types::{Command, Value};
+use crate::types::{Command, Expiration, Value};
 
 pub(crate) fn parse_command(input: &[u8]) -> IResult<&[u8], Command> {
     let (remaining, val) = parse_array(input)?;
@@ -49,7 +49,7 @@ pub(crate) fn parse_command(input: &[u8]) -> IResult<&[u8], Command> {
                 Command::Set(
                     key.to_owned(),
                     value.to_owned(),
-                    Some(parsed_expr_val * 1000),
+                    Some(Expiration::Ex(parsed_expr_val)),
                 ),
             ))
         }
@@ -62,7 +62,11 @@ pub(crate) fn parse_command(input: &[u8]) -> IResult<&[u8], Command> {
 
             Ok((
                 remaining,
-                Command::Set(key.to_owned(), value.to_owned(), Some(parsed_expr_val)),
+                Command::Set(
+                    key.to_owned(),
+                    value.to_owned(),
+                    Some(Expiration::Px(parsed_expr_val)),
+                ),
             ))
         }
         ("info", [of_type]) => Ok((remaining, Command::Info(of_type.to_owned()))),
